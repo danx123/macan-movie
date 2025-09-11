@@ -16,37 +16,20 @@ Macan Movie is a modern PyQt6-based video player with support for playlists, thu
 
 ---
 📸 Screenshots
-<img width="1365" height="720" alt="Screenshot 2025-09-10 074602" src="https://github.com/user-attachments/assets/5ba22738-8c0a-4419-a914-ba8b3e0c36b4" />
+<img width="1365" height="767" alt="image" src="https://github.com/user-attachments/assets/0dbcd053-7977-4606-9ab4-25f0a30782e7" />
+
 
 ---
-📝 Changelog:
-Performance Optimization & Progress Bar:
-A new worker thread (VideoScannerWorker) now handles the heavy lifting of scanning your video folders. This completely prevents the main application window from freezing on startup, even with thousands of videos.
-While the scan is in progress, a Progress Dialog is displayed, showing which folder is currently being scanned and the overall progress. This provides crucial feedback to the user.
-The video scanning process now starts shortly after the main window appears (using QTimer.singleShot), improving the perceived startup speed.
-Toolbar Enhancements (Sorting & Video Count):
-	A "Sort by" dropdown menu has been added to the toolbar. You can now sort all videos 		by:
-	Name (A-Z or Z-A)
-	Date Modified (Newest or Oldest)
-A "Total Videos" label has been added to the right side of the toolbar, giving you an immediate count of all videos found across your folders.
+🎬 Macan Movie v3.0.0
+🔥 Changelog
+⚡ Optimasi Cache → metode cache diubah dari SQLite3 menjadi direct write-to-disk → performa lebih cepat dan ringan.
+🔎 Search Function → cari video dengan cepat di playlist / folder.
+⏭️ Auto Next Play → otomatis lanjut ke video berikutnya.
+📂 Persistent Sorting → metode pengurutan file/folder tersimpan otomatis.
+🏷️ Now Playing Label → QLabel di player menampilkan nama video yang sedang diputar.
+🎶 Smart Playlist → playlist cerdas berdasarkan hasil pencarian.
 
-Folder Context Menu:
-You can now right-click on a folder thumbnail to bring up a context menu.
-This menu includes a "Remove Folder" option, allowing you to easily un-list a folder from the application without having to go into the "Manage Folders" dialog
-
-In the "Manage Folders" dialog:
-
-- Added a "Clear All Folders" button to remove all folders from the list.
-
-- Added a "Reset Thumbnail Cache" button to clear the stored thumbnail cache.
-
-- Displays the current thumbnail cache file size so you know how much space it's taking up.
-
-In the Video Player:
-
-The video player will now be integrated directly into the main window, replacing the video collection view instead of opening a new window.
-
-Added a "Back" button (left arrow icon) to the video player controls. When clicked, the video will pause and return you to the video collection view.
+---
 
 🛠️ Installation
 Make sure Python 3.9+ is installed. Then run:
