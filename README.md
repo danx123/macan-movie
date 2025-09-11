@@ -22,12 +22,12 @@ Macan Movie is a modern PyQt6-based video player with support for playlists, thu
 ---
 🎬 Macan Movie v3.0.0
 🔥 Changelog
-⚡ Optimasi Cache → metode cache diubah dari SQLite3 menjadi direct write-to-disk → performa lebih cepat dan ringan.
-🔎 Search Function → cari video dengan cepat di playlist / folder.
-⏭️ Auto Next Play → otomatis lanjut ke video berikutnya.
-📂 Persistent Sorting → metode pengurutan file/folder tersimpan otomatis.
-🏷️ Now Playing Label → QLabel di player menampilkan nama video yang sedang diputar.
-🎶 Smart Playlist → playlist cerdas berdasarkan hasil pencarian.
+⚡ Cache Optimization → cache method changed from SQLite3 to direct write-to-disk → faster and lighter performance.
+🔎 Search Function → quickly search for videos in playlists/folders.
+⏭️ Auto Next Play → automatically advances to the next video.
+📂 Persistent Sorting → automatically saved file/folder sorting method.
+🏷️ Now Playing Label → QLabel in the player displays the name of the currently playing video.
+🎶 Smart Playlist → smart playlist based on search results.
 
 ---
 
