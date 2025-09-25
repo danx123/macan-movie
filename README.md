@@ -20,9 +20,10 @@ Macan Movie is a modern PyQt6-based video player with support for playlists, thu
 <img width="1365" height="767" alt="image" src="https://github.com/user-attachments/assets/40ab3546-3fe2-4fe9-9ac5-7c1ac3b58260" />
 
 ---
-🎬 Macan Movie v3.5.0
+🎬 Macan Movie v3.5.1
 🔥 Changelog
-- Added TV Online
+- Update framework
+- Update Engine (yt-dlp)
 
 ---
 
