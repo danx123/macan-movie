@@ -1,10 +1,10 @@
 📺 Macan Movie
-Macan Movie is a modern PyQt6-based video player with support for playlists, thumbnail previews, subtitles (SRT), themes, and a mini player. This project is part of the Macan Angkasa ecosystem.
+Macan Movie is a modern PySide6-based video player with support for playlists, thumbnail previews, subtitles (SRT), themes, and a mini player. This project is part of the Macan Angkasa ecosystem.
 
 ---
 
 ✨ Key Features
-🎬 Modern Video Player UI with PyQt6 + QtMultimedia
+🎬 Modern Video Player UI with PySide6 + QtMultimedia
 🎞️ Thumbnail Preview on slider hover (powered by OpenCV)
 📜 Subtitle (SRT) Support with transparent overlay text rendering
 🎶 Mini Player Mode (small, always-on-top window)
@@ -20,7 +20,7 @@ Macan Movie is a modern PyQt6-based video player with support for playlists, thu
 <img width="1365" height="767" alt="image" src="https://github.com/user-attachments/assets/40ab3546-3fe2-4fe9-9ac5-7c1ac3b58260" />
 
 ---
-🎬 Macan Movie v3.5.2
+🎬 Macan Movie v3.5.3
 🔥 Changelog
 - Update framework
 - Update Engine (yt-dlp)
