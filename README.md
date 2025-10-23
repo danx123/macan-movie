@@ -17,13 +17,16 @@ Macan Movie is a modern PySide6-based video player with support for playlists, t
 
 ---
 📸 Screenshots
-<img width="1365" height="767" alt="image" src="https://github.com/user-attachments/assets/40ab3546-3fe2-4fe9-9ac5-7c1ac3b58260" />
+<img width="1271" height="683" alt="Screenshot 2025-10-23 201727" src="https://github.com/user-attachments/assets/8de7e5d6-672b-4045-a4e4-91f33bf9b05a" />
+
 
 ---
-🎬 Macan Movie v3.5.5
+🎬 Macan Movie v3.7.0
+- Update Engine (yt-dlp)
+- Added QSettings
+- Change StyleSheet to Dark
 🔥 Changelog
-- Change path thumbnails cache to (Users/AppData/local/MacanMovie)
-- Update engine yt-dlp (online streaming)
+
 ---
 
 🛠️ Installation
