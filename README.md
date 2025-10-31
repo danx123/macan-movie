@@ -50,6 +50,4 @@ Double-click thumbnail → Play video
 
 ---
 
-📌 Note
-Some features (icons, video streaming) require qtawesome & yt-dlp.
-Configurations & playlists are automatically saved in player_config.json.
+
