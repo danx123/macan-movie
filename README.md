@@ -17,14 +17,29 @@ Macan Movie is a modern PySide6-based video player with support for playlists, t
 
 ---
 📸 Screenshots
-<img width="1400" height="1812" alt="macan-movie-pro-v380-post-github" src="https://github.com/user-attachments/assets/b57402f6-ef6f-42c1-88b2-556cfac143dc" />
+<img width="1269" height="683" alt="Screenshot 2025-11-10 072946" src="https://github.com/user-attachments/assets/25018c85-8cd1-4754-a0fa-d8c6e2cbf692" />
+<img width="1271" height="686" alt="Screenshot 2025-11-10 073040" src="https://github.com/user-attachments/assets/290c0782-4b81-416c-aeb6-f5b182f02ee1" />
+
+
 
 
 ---
-🎬 Macan Movie v3.8.0
-- Improve Performance
-- Update Engine (macan-engine)
-
+🎬 Macan Movie v4.0.0
+🚀 Performance & Responsiveness
+Asynchronous Thumbnail Generation: This is the most significant change. The synchronous generate_thumbnail function has been replaced by a multithreaded system using QThreadPool and QRunnable (ThumbnailWorker).
+Non-Blocking UI: Thumbnails for the collection (VideoThumbnailWidget) and folder previews (FolderThumbnailWidget) are now generated in the background. This prevents the user interface from freezing or stuttering when loading or scrolling through large video libraries.
+Lazy Loading: Widgets now display a "Loading..." placeholder text and are updated with the thumbnail image via a Qt signal (@Slot) once the background worker completes its task.
+🌎 Internationalization (i18n)
+UI Translation: A comprehensive pass was made to translate the application's user interface from Indonesian (Bahasa Indonesia) to English.
+Affected Components: This includes tooltips, button labels, placeholders, dialog titles, and message box text in ModernVideoPlayer, MainWindow, OnlineTVDialog, and ManageFoldersDialog.
+🎨 UI & Style Refinements
+QComboBox Style Fix: Corrected a UI defect where QComboBox dropdown menus (e.g., "Sort by" and "Playlist Source") did not inherit the application's dark theme. Explicit styling was added to their QAbstractItemView for a consistent look and feel.
+Icon & Branding Update:
+The application icon reference was updated from player.ico to macan_movie.ico.
+The "About" dialog title and text were updated from "Macan Movie" to "Macan Movie Pro".
+🧹 Code Refactoring
+Sorting Logic: The sorting logic in MainWindow.sort_and_reflow was simplified. It now defaults to sorting by name and explicitly checks for the date sorting option, improving code clarity.
+Import Optimization: Added QRunnable and QThreadPool to Qt imports to support the new asynchronous thumbnail system.
 ---
 
 🛠️ Installation
