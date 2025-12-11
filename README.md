@@ -24,8 +24,12 @@ Macan Movie is a modern PySide6-based video player with support for playlists, t
 
 
 ---
-🎬 Macan Movie v4.6.1
-- update macan engine
+🎬 Macan Movie v5.0.0
+- Added auto-hide controls in fullscreen mode
+- Added timestamp on thumbnail seekbar preview
+- Improved fullscreen experience
+- Bug fixes and performance improvements
+- Added Check Update
 ---
 
 🛠️ Installation
