@@ -17,19 +17,15 @@ Macan Movie is a modern PySide6-based video player with support for playlists, t
 
 ---
 📸 Screenshots
-<img width="1269" height="683" alt="Screenshot 2025-11-10 072946" src="https://github.com/user-attachments/assets/25018c85-8cd1-4754-a0fa-d8c6e2cbf692" />
-<img width="1271" height="686" alt="Screenshot 2025-11-10 073040" src="https://github.com/user-attachments/assets/290c0782-4b81-416c-aeb6-f5b182f02ee1" />
-
-
+<img width="1365" height="767" alt="Screenshot 2025-12-29 233229" src="https://github.com/user-attachments/assets/501abd29-128e-4b08-bf2a-c63d5ae28958" />
+<img width="1365" height="767" alt="Screenshot 2025-12-29 235408" src="https://github.com/user-attachments/assets/19ad09c2-a8bd-47b7-a2d2-2997dc2d42cf" />
 
 
 ---
-🎬 Macan Movie v5.0.0
-- Added auto-hide controls in fullscreen mode
-- Added timestamp on thumbnail seekbar preview
-- Improved fullscreen experience
-- Bug fixes and performance improvements
-- Added Check Update
+🎬 Macan Movie v5.5.0
+- Added Visualizer
+- Added Equalizer
+- Added Running text (video title)
 ---
 
 🛠️ Installation
