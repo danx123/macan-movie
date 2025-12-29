@@ -1,13 +1,13 @@
 {
-  "version": "5.0.0",
-  "release_date": "2025-12-11",
+  "version": "5.5.0",
+  "release_date": "2025-12-30",
   "download_url": "https://github.com/danx123/macan-movie/releases/latest",
   "changelog": [
-    "Added auto-hide controls in fullscreen mode",
-    "Added timestamp on thumbnail seekbar preview",
-    "Improved fullscreen experience",
-    "Bug fixes and performance improvements"
+   "Added Visualizer",
+   "Added Equalizer",
+  "Added Running text (video title)"
   ],
   "minimum_version": "4.6.0",
   "update_required": false
+
 }
