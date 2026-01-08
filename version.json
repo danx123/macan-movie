@@ -1,13 +1,13 @@
 {
-  "version": "5.5.0",
-  "release_date": "2025-12-30",
+  "version": "5.7.0",
+  "release_date": "2026-01-08",
   "download_url": "https://github.com/danx123/macan-movie/releases/latest",
   "changelog": [
-   "Added Visualizer",
-   "Added Equalizer",
-  "Added Running text (video title)"
+   "Added libVLV for online TV" 
+  
   ],
   "minimum_version": "4.6.0",
   "update_required": false
 
 }
+
