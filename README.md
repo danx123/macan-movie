@@ -22,37 +22,7 @@ Macan Movie is a modern PySide6-based video player with support for playlists, t
 
 
 ---
-🎬 Macan Movie v5.7.0
-Macan Movie Pro v5.7.0 introduces a Hybrid Player Engine architecture, designed to deliver optimal performance across both local media playback and online streaming scenarios.
 
-What’s New
-
-Hybrid Player Engine
-
-Local media playback is now powered by QMediaPlayer (FFmpeg backend) for efficient decoding, low latency, and native system integration.
-
-Online TV streaming is handled by libVLC, ensuring superior compatibility with live streams, adaptive formats, and unstable network conditions.
-
-
-Dedicated TV Online Player
-
-The TV Online player architecture is adapted from Macan Vision, bringing proven stability, refined buffering behavior, and resilient stream handling.
-
-
-Engine Isolation & Optimization
-
-Each playback engine operates within its intended domain, preventing cross-interference and improving overall reliability.
-
-
-Improved Playback Consistency
-
-Seamless switching between local playback and online TV without affecting application stability or performance.
-
-
-
-Summary
-This release transforms Macan Movie Pro into a dual-engine media platform, combining native efficiency and streaming robustness within a single, cohesive player architecture.
----
 
 🛠️ Installation
 Make sure Python 3.9+ is installed. Then run:
