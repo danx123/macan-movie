@@ -1,15 +1,16 @@
 {
-  "version": "6.5.0",
-  "release_date": "2026-02-01",
+  "version": "7.5.0",
+  "release_date": "2026-02-03",
   "download_url": "https://github.com/danx123/macan-movie/releases/latest",
   "changelog": [
-   "optimized" 
+   "update framework" 
   
   ],
   "minimum_version": "4.6.0",
   "update_required": false
 
 }
+
 
 
 
