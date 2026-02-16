@@ -1,15 +1,16 @@
 {
-  "version": "8.5.0",
-  "release_date": "2026-02-15",
+  "version": "8.5.1",
+  "release_date": "2026-02-16",
   "download_url": "https://github.com/danx123/macan-movie/releases/latest",
   "changelog": [
-   "added color adjust" 
+   "optimized" 
   
   ],
   "minimum_version": "4.6.0",
   "update_required": false
 
 }
+
 
 
 
