@@ -1,15 +1,16 @@
 {
-  "version": "8.5.5",
-  "release_date": "2026-02-16",
+  "version": "8.7.0",
+  "release_date": "2026-02-20",
   "download_url": "https://github.com/danx123/macan-movie/releases/latest",
   "changelog": [
-   "added macan explorer" 
+   "optimized" 
   
   ],
   "minimum_version": "4.6.0",
   "update_required": false
 
 }
+
 
 
 
