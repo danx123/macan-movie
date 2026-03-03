@@ -1,5 +1,5 @@
 {
-  "version": "9.3.0",
+  "version": "9.3.2",
   "release_date": "2026-03-03",
   "download_url": "https://github.com/danx123/macan-movie/releases/latest",
   "changelog": [
@@ -10,6 +10,7 @@
   "update_required": false
 
 }
+
 
 
 
