@@ -3,6 +3,7 @@ Macan Movie is a modern PySide6-based video player with support for playlists, t
 
 ---
 
+
 ✨ Key Features
 🎬 Modern Video Player UI with PySide6 + QtMultimedia
 🎞️ Thumbnail Preview on slider hover (powered by OpenCV)
@@ -14,10 +15,13 @@ Macan Movie is a modern PySide6-based video player with support for playlists, t
 🔗 YouTube / Online Video Support via yt-dlp
 💾 Thumbnail Cache using SQLite for fast loading
 📺 TV Online
+🌐 Streaming Media
 
 ---
 📸 Screenshots
-<img width="1365" height="767" alt="Screenshot 2026-02-16 175133" src="https://github.com/user-attachments/assets/a9afbc09-b34e-48c7-ba35-638a20cab29c" />
+<img width="1365" height="767" alt="image" src="https://github.com/user-attachments/assets/e5555797-edb8-4027-ae2a-2e8bb9784b2f" />
+
+<img width="1363" height="739" alt="Screenshot 2026-04-28 195544" src="https://github.com/user-attachments/assets/2c454968-0bd7-4345-a338-ca399da7dd82" />
 <img width="1365" height="767" alt="Screenshot 2026-02-16 175144" src="https://github.com/user-attachments/assets/a22b3402-7f45-4d6a-988b-66575bfa72c6" />
 <img width="1365" height="767" alt="Screenshot 2025-12-29 235408" src="https://github.com/user-attachments/assets/19ad09c2-a8bd-47b7-a2d2-2997dc2d42cf" />
 
