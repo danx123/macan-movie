@@ -2,11 +2,6 @@
 Macan Movie is a modern PySide6-based video player with support for playlists, thumbnail previews, subtitles (SRT), themes, and a mini player. This project is part of the Macan Angkasa ecosystem.
 
 ---
-<img width="864" height="1821" alt="macan movie pro v10 5 2" src="https://github.com/user-attachments/assets/c656b129-f9c1-4be0-867f-dd16f03ef6fd" />
-
-
-
----
 
 
 ✨ Key Features
