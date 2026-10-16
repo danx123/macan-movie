@@ -9,9 +9,7 @@
   <img alt="Macan Angkasa" src="https://img.shields.io/badge/Part%20of-Macan%20Angkasa-red">
 </p>
 
-<p align="center">
-  <a href="https://github.com/danx123/macan-movie/releases"><img alt="Total downloads" src="https://img.shields.io/github/downloads/danx123/macan-movie/total?logo=github&label=Downloads"></a>
-</p>
+
 
 **Macan Movie** is a modern PySide6-based video player for Windows with a choice of three playback engines, a 10-band equalizer, playlists, thumbnail previews, subtitles, TV online and streaming. This project is part of the **Macan Angkasa** ecosystem.
 
