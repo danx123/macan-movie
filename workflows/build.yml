@@ -10,17 +10,18 @@ jobs:
     name: Cross-compile Windows wheel (abi3)
     runs-on: ubuntu-latest
     env:
-      # [FIX] Samakan minor version FFmpeg dengan `ffmpeg-next = "7.0"` di
-      # Cargo.toml. ffmpeg-next punya banyak `match` Rust manual (pixel
-      # format, codec ID, dll) yang di-generate/di-maintain untuk rentang
-      # versi tertentu -- kalau FFmpeg yang dikompilasi lebih baru (mis.
-      # n7.1) dan menambah varian enum baru, bindgen ikut memasukkannya ke
+      # [UPDATE] Samakan minor version FFmpeg dengan `ffmpeg-next = "9.0"` di
+      # Cargo.toml (sudah dinaikin bareng, lihat komentar [UPDATE] di sana).
+      # ffmpeg-next punya banyak `match` Rust manual (pixel format, codec ID,
+      # dll) yang di-generate/di-maintain untuk rentang versi tertentu --
+      # kalau FFmpeg yang dikompilasi lebih baru dari yang crate-nya dukung
+      # dan menambah varian enum baru, bindgen ikut memasukkannya ke
       # bindings.rs, tapi match statement di ffmpeg-next belum kenal varian
       # itu -> compile error E0004 "non-exhaustive patterns". Kalau nanti
-      # mau naik ke FFmpeg 7.1, naikkan juga `ffmpeg-next` (dan
-      # `ffmpeg-sys-next` transitif-nya) ke versi yang sudah support 7.1
-      # secara eksplisit, jangan cuma ganti tag ini sendirian.
-      FFMPEG_TAG: n7.1
+      # mau naik lagi ke versi FFmpeg berikutnya, naikkan juga `ffmpeg-next`
+      # (dan `ffmpeg-sys-next` transitif-nya) ke versi yang sudah support
+      # versi itu secara eksplisit dulu, jangan cuma ganti tag ini sendirian.
+      FFMPEG_TAG: n9.0
 
     steps:
       - uses: actions/checkout@v4
@@ -79,7 +80,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/ffmpeg-windows
-          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v18-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
+          # [UPDATE] v18 -> v19: naikin suffix cache-key biar cache lama
+          # (hasil build FFmpeg n7.1) gak ke-reuse keliru buat FFMPEG_TAG
+          # n9.0 yang baru -- walau FFMPEG_TAG sudah ikut di key, nomor versi
+          # ini dinaikin manual tiap kali konfigurasi/versi FFmpeg-nya lompat
+          # signifikan (biar gampang dibedain di tab cache Actions).
+          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v23-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
 
       - name: 🎬 Kompilasi libdav1d statis (cross ke Windows)
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
@@ -206,6 +212,30 @@ jobs:
           # "Kompilasi libmp3lame statis" di atas, dan --enable-libmp3lame
           # bakal gagal diam-diam (fallback ke encoder gak ke-enable, bukan
           # error keras) sehingga error yang sama tetap muncul di runtime.
+          #
+          # [UPDATE FFmpeg 9.0] `libpostproc` sudah DIHAPUS TOTAL dari FFmpeg
+          # (patch upstream Mei 2025, jadi udah gak ada lagi mulai rilis 9.0).
+          # Opsi `--disable-postproc` yang dulu ada di sini sekarang gak
+          # dikenali sama sekali sama configure ("Unknown option") dan bikin
+          # configure langsung exit 1 sebelum sempet ngecek opsi lain -- baris
+          # itu DIHAPUS di sini, bukan cuma di-skip, karena keberadaannya aja
+          # (mau enable atau disable) udah bikin error. Gak ada dampak fungsional
+          # ke media_engine karena postproc emang gak pernah dipakai (cuma
+          # filter `pp` di libavfilter yang sekarang udah hilang bareng lib-nya).
+          #
+          # [UPDATE FFmpeg 9.0] `d3d12va` adalah hwaccel BARU (Direct3D 12
+          # video acceleration) yang baru ditambahin di FFmpeg 9.0, gak ada
+          # di 7.1. Meskipun ini autodetect (gak dulu eksplisit di-enable),
+          # header publik `libavutil/hwcontext_d3d12va.h` tetep ke-install
+          # dan ke-parse sama bindgen-nya ffmpeg-sys-next -- header itu
+          # nge-include `d3d12video.h` (bagian dari DirectX 12 Video API)
+          # yang gak ada di paket mingw-w64 Ubuntu yang kepasang di step
+          # "Pasang toolchain cross mingw-w64" (headernya kekinian banget),
+          # jadi bindgen gagal dengan "fatal error: 'd3d12video.h' file not
+          # found". Sama kayak d3d11va/dxva2/mediafoundation, kita gak butuh
+          # hardware decode di target build ini, jadi paling simpel
+          # ditambahin `--disable-d3d12va` (lihat di bawah) biar headernya
+          # gak ke-install sama sekali.
           ./configure \
             --prefix="$HOME/ffmpeg-windows" \
             --enable-cross-compile \
@@ -218,7 +248,6 @@ jobs:
             --disable-doc \
             --disable-avdevice \
             --disable-avfilter \
-            --disable-postproc \
             --enable-avcodec \
             --enable-avformat \
             --enable-swresample \
@@ -227,6 +256,7 @@ jobs:
             --disable-w32threads \
             --disable-dxva2 \
             --disable-d3d11va \
+            --disable-d3d12va \
             --disable-mediafoundation \
             --enable-libdav1d \
             --enable-libmp3lame \
@@ -237,6 +267,9 @@ jobs:
             
           make -j"$(nproc)"
           make install
+          
+          # Remove problematic hardware context headers to prevent bindgen errors
+          rm -f "$HOME/ffmpeg-windows/include/libavutil/hwcontext_d3d12va.h"
 
       # [BARU] Selalu set FFMPEG_DIR di sini (bukan di dalam step compile),
       # supaya tetap ke-set dengan benar walau step compile di atas di-skip
@@ -271,6 +304,19 @@ jobs:
               "-C", "link-arg=-lsecur32",
               "-C", "link-arg=-lole32",
               "-C", "link-arg=-lcrypt32",
+              # [UPDATE FFmpeg 9.0] `libavformat/tls_schannel.c` -- backend TLS
+              # native Windows (SChannel + CNG) yang BARU di FFmpeg 9.0, auto-
+              # kompilasi begitu target-os=mingw32 (gak butuh --enable flag
+              # apapun, beda dari openssl/gnutls yang opt-in). Dia manggil
+              # fungsi CNG (NCryptOpenStorageProvider, NCryptCreatePersistedKey,
+              # dst) yang tinggal di ncrypt.dll -- import lib-nya (`libncrypt.a`)
+              # udah ada bawaan mingw-w64, tapi gak otomatis ke-link, jadi
+              # ditambahin manual di sini. Ini juga artinya https:// di
+              # PlayerEngine kemungkinan udah/bakal jalan lewat SChannel
+              # bawaan Windows begitu ini kelar, bukan lewat openssl/gnutls
+              # (jadi catatan soal "belum ada backend TLS" di komentar
+              # Cargo.toml sebelumnya perlu direvisi -- akan dicek ulang).
+              "-C", "link-arg=-lncrypt",
               # [FIX] Bungkus lib statis kita + runtime mingw pakai
               # --start-group/--end-group. `ld` itu single-pass (scan kiri
               # ke kanan sekali doang) -- tanpa group ini, `-lmp3lame` di
@@ -296,6 +342,33 @@ jobs:
               "-C", "link-arg=-Wl,--end-group"
           ]
           EOF
+
+      # 🩹 [FIX] bindgen (ffmpeg-sys-next 9.0.1) ikut nge-parse <immintrin.h>
+      # bawaan clang 18, yang nge-include SEMUA header AMX (amxintrin.h,
+      # amxcomplexintrin.h, dst). Di target x86_64-pc-windows-gnu (layout
+      # ms_struct), struct `__tile1024i_str` di amxintrin.h dihasilkan bindgen
+      # dengan #[repr(packed)] + align(64) sekaligus -> rustc E0587/E0080.
+      # FFmpeg gak pakai AMX sama sekali, jadi semua header AMX di-skip
+      # lewat include guard-nya. Nama guard di-grep langsung dari header clang
+      # di runner (bukan ditulis manual) dan harus SEMUA header, karena
+      # men-skip amxintrin.h doang bikin amxcomplexintrin.h gagal dengan
+      # "unknown type name '_tile1024i'". Dikirim ke step berikutnya lewat
+      # GITHUB_ENV -- jadi JANGAN set BINDGEN_EXTRA_CLANG_ARGS_* lagi di
+      # `env:` step maturin (bakal menimpa hasil ini).
+      - name: 🩹 Skip header AMX buat bindgen (E0587 di target mingw)
+        run: |
+          inc=/usr/lib/llvm-18/lib/clang/18/include
+          if [ ! -d "$inc" ]; then
+            inc="$(dirname "$(find /usr/lib -path '*/clang/*/include/immintrin.h' | head -n1)")"
+          fi
+          defs="$(grep -h -m1 '^#ifndef __AMX' "$inc"/amx*.h | awk '{print "-D"$2}' | sort -u | tr '\n' ' ')"
+          if [ -z "$defs" ]; then
+            echo "::error::Guard AMX tidak ketemu di $inc"
+            exit 1
+          fi
+          echo "Header dir : $inc"
+          echo "Guard AMX  : $defs"
+          echo "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu=$defs" >> "$GITHUB_ENV"
 
       # ⚙️ FFmpeg udah dikompilasi manual di step sebelumnya dan diarahkan
       # lewat FFMPEG_DIR (env, sudah di-export ke $GITHUB_ENV). ffmpeg-sys-next
