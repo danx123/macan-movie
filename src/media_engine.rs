@@ -464,11 +464,21 @@ struct Shared {
     // bisa independen ngecek "apa ada seek yang belom gue apply?" tanpa
     // rebutan konsumsi satu sinyal yang sama.
     seek_seq: AtomicU64,
+    video_acked_seq: AtomicU64,
+    audio_acked_seq: AtomicU64,
     seek_target: Mutex<f64>,
 
     playing: AtomicBool,
     stop: AtomicBool,
     eof: AtomicBool,
+    // [BARU] True cuma setelah audio_decode_loop bener2 full-drain (physical
+    // EOF file audio + drain decode-delay buffer). Dipakai bareng `eof`
+    // (yang cuma dikontrol video_decode_loop) di is_eof() -- tanpa ini,
+    // sisi caller (Python) bisa manggil close()/pindah track begitu VIDEO
+    // abis, padahal audio thread masih proses nyelesain sisa decode (mis.
+    // lagi bridging gap PTS gede) -> sisa audio ASLI abis titik itu ikut
+    // ke-drop paksa pas thread di-stop dari luar.
+    audio_eof: AtomicBool,
 
     // Auto-restart dari awal kalau nyampe EOF.
     loop_enabled: AtomicBool,
@@ -644,10 +654,13 @@ impl PlayerEngine {
             volume_bits: AtomicU32::new(1.0f32.to_bits()),
             muted: AtomicBool::new(false),
             seek_seq: AtomicU64::new(0),
+            video_acked_seq: AtomicU64::new(0),
+            audio_acked_seq: AtomicU64::new(0),
             seek_target: Mutex::new(0.0),
             playing: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             eof: AtomicBool::new(false),
+            audio_eof: AtomicBool::new(false), // [BARU]
             loop_enabled: AtomicBool::new(false),
             step_request: AtomicBool::new(false),
             clock_base_pts: Mutex::new(0.0),
@@ -667,7 +680,10 @@ impl PlayerEngine {
             let host = cpal::default_host();
             if let Some(device) = host.default_output_device() {
                 if let Ok(cfg) = device.default_output_config() {
-                    let sample_rate = cfg.sample_rate().0 as i64;
+                    // [UPDATE cpal 0.15 -> 0.18] `SampleRate` sejak 0.17 udah
+                    // bukan tuple struct lagi, tapi type alias `u32` langsung
+                    // -- jadi `.0` di sini dihapus (dulu `cfg.sample_rate().0`).
+                    let sample_rate = cfg.sample_rate() as i64;
                     let channels = cfg.channels() as i64;
                     shared.out_sample_rate.store(sample_rate, Ordering::Relaxed);
                     shared.out_channels.store(channels, Ordering::Relaxed);
@@ -682,41 +698,58 @@ impl PlayerEngine {
                     let stream_cfg: cpal::StreamConfig = cfg.clone().into();
                     let shared_cb = Arc::clone(&shared);
 
-                    let build_result = match cfg.sample_format() {
-                        cpal::SampleFormat::F32 => device.build_output_stream(
-                            &stream_cfg,
+                    // [UPDATE cpal 0.18] Sejak 0.18 semua enum error per-operasi
+                    // (BuildStreamError, StreamError, dkk) udah dilebur jadi satu
+                    // `cpal::Error` (gak ada varian publik yang bisa dikonstruksi
+                    // manual kayak `StreamConfigNotSupported` dulu). Karena di sini
+                    // kita cuma butuh tau "berhasil bikin stream atau enggak" (gak
+                    // butuh cabang per jenis error), pembungkusnya diganti jadi
+                    // `Option` -- cabang selain F32 gak manggil build_output_stream
+                    // sama sekali (jadi gak perlu bikin nilai error tiruan).
+                    let build_result: Option<Result<cpal::Stream, cpal::Error>> = match cfg.sample_format() {
+                        cpal::SampleFormat::F32 => Some(device.build_output_stream(
+                            stream_cfg,
                             move |data: &mut [f32], _| {
-                                if shared_cb.audio_flush.swap(false, Ordering::Relaxed) {
-                                    // Timeline abis loncat (seek/step/loop-restart) --
-                                    // buang semua sample LAMA yg masih ngendon
-                                    // sebelum lanjut konsumsi normal. Tanpa ini,
-                                    // abis seek bakal kedengeran "kilas balik"
-                                    // sepersekian detik audio dari posisi lama.
+                                if shared_cb.audio_flush.swap(false, Ordering::SeqCst) {
                                     while consumer.try_pop().is_some() {}
+                                    shared_cb.audio_buffered_hint.store(0, Ordering::SeqCst);
+                                    for sample in data.iter_mut() {
+                                        *sample = 0.0;
+                                    }
+                                    return;
                                 }
                                 let ch = shared_cb.out_channels.load(Ordering::Relaxed).max(1) as usize;
-                                // Dibaca sekali per callback (bukan per-sample) biar gak ada
-                                // atomic load ribuan kali per buffer -- toh kuping gak bakal
-                                // notice volume berubah di tengah satu buffer (~ms doang).
                                 let vol = shared_cb.effective_volume();
+                                let mut popped_samples = 0usize;
+
                                 for sample in data.iter_mut() {
-                                    // 0.0 = diam kalau buffer kosong (underrun)
-                                    *sample = consumer.try_pop().unwrap_or(0.0) * vol;
+                                    if let Some(s) = consumer.try_pop() {
+                                        *sample = s * vol;
+                                        popped_samples += 1;
+                                    } else {
+                                        *sample = 0.0;
+                                    }
                                 }
-                                // Frame count buat clock TETEP dihitung dari data yang
-                                // dikonsumsi apa adanya -- volume/mute gak boleh ganggu
-                                // sinkronisasi audio-video.
-                                shared_cb.audio_frames_played.fetch_add((data.len() / ch) as u64, Ordering::Relaxed);
+
+                                // Update sisa buffer secara real-time agar is_eof() dan wait_for_seek_ready() akurat
+                                shared_cb.audio_buffered_hint.store(consumer.occupied_len(), Ordering::Relaxed);
+
+                                // Master clock: Hanya maju sesuai jumlah sample asli yang keluar.
+                                // KECUALI jika audio sudah benar-benar EOF namun video masih punya sisa durasi,
+                                // biarkan clock tetap maju agar sisa frame video di akhir tetap bisa tampil sampai habis.
+                                if popped_samples > 0 {
+                                    shared_cb.audio_frames_played.fetch_add((popped_samples / ch) as u64, Ordering::Relaxed);
+                                } else if shared_cb.audio_eof.load(Ordering::Relaxed) && shared_cb.playing.load(Ordering::Relaxed) {
+                                    shared_cb.audio_frames_played.fetch_add((data.len() / ch) as u64, Ordering::Relaxed);
+                                }
                             },
                             |err| eprintln!("[media_engine] audio stream error: {err}"),
                             None,
-                        ),
-                        // Device jarang minta selain f32 di WASAPI shared mode,
-                        // tapi kalau ketemu kasusnya, tambahin cabang i16/u16 di sini.
-                        _ => Err(cpal::BuildStreamError::StreamConfigNotSupported),
+                        )),
+                        _ => None,
                     };
 
-                    if let Ok(stream) = build_result {
+                    if let Some(Ok(stream)) = build_result {
                         // JANGAN langsung .play() di sini. Kalau langsung jalan,
                         // callback di atas bakal langsung mulai narik ring buffer
                         // yang masih kosong (decode thread belom sempet ngisi
@@ -796,7 +829,8 @@ impl PlayerEngine {
             // nyegah audio "kabur duluan" ninggalin video pas video masih
             // proses nyiapin frame pertama.
             let target = self.shared.position();
-            self.wait_for_seek_ready(target);
+            let seq = self.shared.seek_seq.load(Ordering::SeqCst);
+            self.wait_for_seek_ready(target, seq);
             if let Some(stream) = self._audio_stream.as_ref() {
                 let _ = stream.play();
             }
@@ -874,6 +908,7 @@ impl PlayerEngine {
     /// duluan drpd video". Kalau lagi paused, gak ada yang perlu ditunggu
     /// (stream emang udah diem, dan Python nunggu next tick apa adanya).
     fn seek(&mut self, second: f64) {
+        let target = second.max(0.0);
         let was_playing = self.shared.playing.load(Ordering::Relaxed);
         if was_playing {
             if let Some(stream) = self._audio_stream.as_ref() {
@@ -882,14 +917,22 @@ impl PlayerEngine {
         }
 
         self.shared.eof.store(false, Ordering::SeqCst);
-        *self.shared.seek_target.lock().unwrap() = second;
-        self.shared.seek_seq.fetch_add(1, Ordering::SeqCst);
+        self.shared.audio_eof.store(false, Ordering::SeqCst);
+        *self.shared.seek_target.lock().unwrap() = target;
+
+        // Bersihkan antrian video & reset clock terpusat di sini (1x saja)
+        // agar thread video & audio tidak saling menimpa clock/flush satu sama lain!
+        self.shared.video_q.lock().unwrap().clear();
+        self.shared.reset_clock(target);
+
+        let new_seq = self.shared.seek_seq.fetch_add(1, Ordering::SeqCst) + 1;
 
         if was_playing {
-            self.wait_for_seek_ready(second);
+            self.wait_for_seek_ready(target, new_seq);
             if let Some(stream) = self._audio_stream.as_ref() {
                 let _ = stream.play();
             }
+            *self.shared.clock_base_wall.lock().unwrap() = Some(Instant::now());
         }
     }
 
@@ -919,8 +962,33 @@ impl PlayerEngine {
     }
 
     fn is_eof(&self) -> bool {
-        self.shared.eof.load(Ordering::Relaxed)
-            && self.shared.video_q.lock().unwrap().is_empty()
+        // [FIX] File audio murni (has_video = false): video_decode_loop
+        // return LANGSUNG di awal begitu gak nemu stream video (baris
+        // ~1124), gak pernah nyentuh shared.eof sama sekali -- tanpa
+        // `!self.has_video ||` di sini, is_eof() bakal selalu false
+        // selamanya buat audio-only, playback gak akan pernah kedetect
+        // "selesai". Pola sama persis kayak video_ready di
+        // wait_for_seek_ready().
+        let video_done = !self.has_video || (
+            self.shared.eof.load(Ordering::Relaxed)
+                && self.shared.video_q.lock().unwrap().is_empty()
+        );
+        if !video_done {
+            return false;
+        }
+        // [FIX] Dulu cuma nunggu video -- caller (Python) bisa nganggep
+        // playback "selesai" begitu video abis, padahal audio thread
+        // masih proses drain/bridging gap. Kalau caller lalu manggil
+        // close() (stop.store(true)), sisa audio ASLI setelah titik itu
+        // ikut ke-drop paksa. Sekarang tunggu audio_eof (decode fisik
+        // tuntas) DAN ring buffer playback bener2 kosong (bukan cuma
+        // "hint" sesaat sebelum drain terakhir).
+        if self.has_audio {
+            self.shared.audio_eof.load(Ordering::Relaxed)
+                && self.shared.audio_buffered_hint.load(Ordering::Relaxed) == 0
+        } else {
+            true
+        }
     }
 
     /// Panggil ini tiap tick UI (misal tiap ~8-16ms). Balikin None kalau
@@ -1042,33 +1110,34 @@ impl PlayerEngine {
     /// buffer-nya siap, ninggalin video yang masih proses ngejar -- kerasa
     /// "audio duluan drpd video" tiap abis play()/seek(). Timeout ada biar
     /// UI gak nge-hang selamanya kalau video-nya lambat/macet.
-    fn wait_for_seek_ready(&self, target: f64) {
+    fn wait_for_seek_ready(&self, target: f64, expected_seq: u64) {
         let sr = self.shared.out_sample_rate.load(Ordering::Relaxed).max(1) as usize;
         let ch = self.shared.out_channels.load(Ordering::Relaxed).max(1) as usize;
-        let audio_target = (sr * ch) / 7; // ~150ms readahead sebelum mulai bunyi
-        let deadline = Instant::now() + Duration::from_millis(400);
+        let audio_target = (sr * ch) / 8; // ~125ms readahead baru pada posisi target
+        let deadline = Instant::now() + Duration::from_millis(450);
 
         while Instant::now() < deadline {
-            let audio_ready = !self.has_audio
-                || self.shared.audio_buffered_hint.load(Ordering::Relaxed) >= audio_target;
-            // [FIX] File audio murni (has_video = false) gak akan PERNAH
-            // ngisi video_q (video_decode_loop keluar cepat begitu gak
-            // nemu stream video) -- tanpa `!self.has_video ||` di sini,
-            // video_ready gak akan pernah true buat file kayak gitu, dan
-            // wait_for_seek_ready() bakal SELALU kena timeout 400ms penuh
-            // tiap kali play()/seek() dipanggil, walau audionya udah siap
-            // dari awal.
-            let video_ready = !self.has_video || {
-                let q = self.shared.video_q.lock().unwrap();
-                q.back().map(|f| f.pts + 0.05 >= target).unwrap_or(false)
-            };
-            if audio_ready && video_ready {
-                return;
+            let a_acked = !self.has_audio
+                || self.shared.audio_acked_seq.load(Ordering::SeqCst) >= expected_seq;
+            let v_acked = !self.has_video
+                || self.shared.video_acked_seq.load(Ordering::SeqCst) >= expected_seq;
+
+            if a_acked && v_acked {
+                let audio_ready = !self.has_audio
+                    || self.shared.audio_eof.load(Ordering::Relaxed)
+                    || self.shared.audio_buffered_hint.load(Ordering::Relaxed) >= audio_target;
+                let video_ready = !self.has_video
+                    || self.shared.eof.load(Ordering::Relaxed)
+                    || {
+                        let q = self.shared.video_q.lock().unwrap();
+                        q.front().map(|f| f.pts + 0.1 >= target).unwrap_or(false)
+                    };
+                if audio_ready && video_ready {
+                    return;
+                }
             }
-            thread::sleep(Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(4));
         }
-        // Timeout -- lanjut aja apa adanya. Mending mulai agak nunda drpd
-        // UI (tombol Play/seekbar) kekunci nunggu tanpa batas.
     }
 }
 
@@ -1119,6 +1188,7 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
     let mut vframe = ffmpeg_next::frame::Video::empty();
     let mut applied_seek_seq: u64 = 0;
     let mut sent_eof = false;
+    let mut video_skip_until: Option<f64> = None;
 
     // SATU iterator paket, dipakai berulang -- BUKAN dibikin baru tiap
     // baca satu paket (`input_ctx.packets().next()` tiap iterasi loop).
@@ -1153,15 +1223,15 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
             packet_iter = None; // lepas borrow dulu biar input_ctx bisa dipinjem buat seek()
             let sec = *shared.seek_target.lock().unwrap();
             let ts = av_time_base_ts(sec);
-            if input_ctx.seek(ts, ..ts).is_ok() {
-                vdecoder.flush();
-                shared.video_q.lock().unwrap().clear();
-                shared.reset_clock(sec);
-                shared.eof.store(false, Ordering::Relaxed);
-                sent_eof = false;
-            }
+            let _ = input_ctx.seek(ts, ..ts);
+            vdecoder.flush();
+            shared.video_q.lock().unwrap().clear();
+            shared.eof.store(false, Ordering::Relaxed);
+            sent_eof = false;
+            video_skip_until = Some(sec);
             packet_iter = Some(input_ctx.packets()); // iterator baru, mulai dari posisi abis seek
             applied_seek_seq = current_seq;
+            shared.video_acked_seq.store(current_seq, Ordering::SeqCst);
         }
 
         if !shared.playing.load(Ordering::Relaxed) {
@@ -1186,7 +1256,7 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
                         continue;
                     }
                     if vdecoder.send_packet(&packet).is_ok() && vdecoder.receive_frame(&mut vframe).is_ok() {
-                        let pts = vframe.timestamp().unwrap_or(0) as f64 * vtb;
+                        let pts = vframe.pts().or_else(|| vframe.timestamp()).unwrap_or(0) as f64 * vtb;
                         if let Ok(rgb) = scale_to_rgb(&vframe, &mut scaler, vdecoder.format(), vwidth, vheight) {
                             shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
                             shared.reset_clock(pts);
@@ -1225,7 +1295,7 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
                     // terakhir video ilang juga (gak seketara audio krn gak
                     // ada log-nya, tapi bug-nya sama persis).
                     while vdecoder.receive_frame(&mut vframe).is_ok() {
-                        let pts = vframe.timestamp().unwrap_or(0) as f64 * vtb;
+                        let pts = vframe.pts().or_else(|| vframe.timestamp()).unwrap_or(0) as f64 * vtb;
                         if let Ok(rgb) = scale_to_rgb(&vframe, &mut scaler, vdecoder.format(), vwidth, vheight) {
                             shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
                         }
@@ -1236,11 +1306,9 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
                     );
                 }
                 if shared.loop_enabled.load(Ordering::Relaxed) {
-                    // Auto-restart: minta seek ke detik 0 lewat generation
-                    // counter yang sama kayak seek manual -- audio_decode_loop
-                    // bakal ikut nangkep & seek balik ke 0 juga di iterasi
-                    // dia berikutnya, independen, gak perlu ditunggu di sini.
                     *shared.seek_target.lock().unwrap() = 0.0;
+                    shared.video_q.lock().unwrap().clear();
+                    shared.reset_clock(0.0);
                     shared.seek_seq.fetch_add(1, Ordering::SeqCst);
                 } else {
                     shared.eof.store(true, Ordering::Relaxed);
@@ -1256,7 +1324,18 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
 
         if vdecoder.send_packet(&packet).is_ok() {
             while vdecoder.receive_frame(&mut vframe).is_ok() {
-                let pts = vframe.timestamp().unwrap_or(0) as f64 * vtb;
+                // Jika ada seek baru di tengah decode GOP panjang, langsung batalkan!
+                if shared.seek_seq.load(Ordering::SeqCst) != applied_seek_seq {
+                    break;
+                }
+                let pts = vframe.pts().or_else(|| vframe.timestamp()).unwrap_or(0) as f64 * vtb;
+                if let Some(target_sec) = video_skip_until {
+                    // Skip konversi RGB untuk frame keyframe lama sebelum titik seek
+                    if pts + 0.035 < target_sec {
+                        continue;
+                    }
+                    video_skip_until = None;
+                }
                 if let Ok(rgb) = scale_to_rgb(&vframe, &mut scaler, vdecoder.format(), vwidth, vheight) {
                     shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
                 }
@@ -1265,23 +1344,64 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
     }
 }
 
-/// Loop thread AUDIO: demux+decode audio dari file handle-nya SENDIRI,
-/// resample ke format device, dorong ke ring buffer. Sama sekali gak
-/// nyentuh video_q -- itu urusan video_decode_loop(). Backpressure &
-/// seek-nya independen total dari video, jadi video yang lagi berat gak
-/// akan pernah bisa bikin thread ini (dan ring buffer-nya) ke-block.
-///
-/// Helper: resample SATU frame audio hasil decode -> push ke ring buffer.
-/// Dipisah dari loop utama (BUKAN cuma dipanggil sekali) karena dipanggil
-/// dari DUA tempat: (1) jalur normal abis receive_frame() dalem loop paket,
-/// (2) jalur drain abis send_eof() -- FFmpeg codec kayak AAC/Opus sering
-/// nahan beberapa frame di buffer internal (decode delay/reorder), dan itu
-/// CUMA keluar via receive_frame() lagi SETELAH send_eof() dipanggil.
-/// Sebelumnya jalur (2) ini gak ada sama sekali -> sample-sample terakhir
-/// yang masih ke-buffer di decoder ilang gitu aja, bikin audio berhenti
-/// sebelum video abis walau track audio-nya sebenernya sama panjang.
+
+/// Helper untuk mendorong slice float hasil resample ke viz_ring & producer ringbuffer,
+/// sekaligus mengembalikan jumlah sample frame (per-channel) yang benar-benar tertulis.
+fn push_floats_to_ring(
+    floats: &[f32],
+    producer: &mut AudioProducer,
+    shared: &Shared,
+    out_rate: u32,
+    out_channels: u16,
+) -> usize {
+    let ch = out_channels.max(1) as usize;
+    let n_samples = floats.len();
+    if n_samples == 0 {
+        return 0;
+    }
+
+    // Downmix ke mono & simpan ke viz_ring buat FFT visualizer
+    {
+        let mut viz = shared.viz_ring.lock().unwrap();
+        for frame in floats.chunks(ch) {
+            let mono = frame.iter().sum::<f32>() / ch as f32;
+            viz.push_back(mono);
+        }
+        while viz.len() > VIZ_RING_CAP {
+            viz.pop_front();
+        }
+    }
+
+    let mut pushed_total = 0;
+    let a_cap = (out_rate as usize) * ch * 2;
+
+    let current_seq = shared.seek_seq.load(Ordering::SeqCst);
+    while pushed_total < n_samples {
+        if shared.stop.load(Ordering::Relaxed)
+            || shared.seek_seq.load(Ordering::SeqCst) != current_seq
+        {
+            break;
+        }
+        // Tunggu sampai cpal callback selesai menguras buffer lama jika audio_flush masih true
+        if shared.audio_flush.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        if producer.occupied_len() >= a_cap {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        let chunk = &floats[pushed_total..];
+        let pushed = producer.push_slice(chunk);
+        pushed_total += pushed;
+        shared.audio_buffered_hint.store(producer.occupied_len(), Ordering::Relaxed);
+    }
+
+    pushed_total / ch
+}
+
 fn push_resampled_audio_frame(
-    aframe: &ffmpeg_next::frame::Audio,
+    aframe: &mut ffmpeg_next::frame::Audio,
     resampler: &mut Option<ffmpeg_next::software::resampling::Context>,
     producer: &mut AudioProducer,
     shared: &Shared,
@@ -1289,66 +1409,97 @@ fn push_resampled_audio_frame(
     out_layout: ffmpeg_next::util::channel_layout::ChannelLayout,
     out_rate: u32,
     out_channels: u16,
-    expected_audio_pts: &mut f64,
+    expected_audio_pts: &mut Option<f64>,
+    audio_skip_until: &mut Option<f64>,
     atb: f64,
 ) {
-    // Ambil PTS frame aktual, atau gunakan expected jika tidak ada
-    let frame_pts = aframe.timestamp().map(|ts| ts as f64 * atb).unwrap_or(*expected_audio_pts);
+    // Gunakan pts() atau timestamp() dari frame
+    let raw_ts = aframe.pts().or_else(|| aframe.timestamp());
+    let frame_pts = raw_ts.map(|ts| ts as f64 * atb);
+    let in_rate = (aframe.rate() as f64).max(1.0);
+    let frame_dur = aframe.samples() as f64 / in_rate;
 
-    // 1. PAD SILENCE JIKA ADA GAP (Start Delay / Audio Bolong)
-    // Toleransi 0.1 detik untuk mencegah pergeseran sync.
-    if frame_pts > *expected_audio_pts + 0.1 {
-        let raw_gap_sec = frame_pts - *expected_audio_pts;
-
-        // [FIX] BATASI gap yang di-pad. Gap gede (misal belasan detik)
-        // hampir pasti BUKAN silence asli di track, tapi anomali PTS
-        // (glitch timestamp/reorder codec di titik tertentu file).
-        // Kalau dibiarin tanpa batas, loop backpressure di bawah bakal
-        // ngabisin waktu WALL-CLOCK nyata cuma buat nyorong silence
-        // sebanyak itu ke ring buffer -- sementara video jalan terus
-        // independen dan bisa nyampe EOF duluan (nge-trigger shared.stop)
-        // SEBELUM decode thread ini sempet balik ngedecode sisa audio
-        // ASLI setelah titik gap tsb. Efeknya: sisa audio asli abis
-        // titik gap ini ilang total, kedengeran kayak "audio berhenti
-        // duluan" walau file aslinya audio-nya lebih panjang.
-        // Dicap ke MAX_GAP_PAD_SEC detik: gap wajar (start delay dsb)
-        // tetep di-pad buat sync, gap ekstrem cuma di-log & di-resync
-        // tanpa nelen waktu real audio berikutnya.
-        const MAX_GAP_PAD_SEC: f64 = 2.0;
-        if raw_gap_sec > MAX_GAP_PAD_SEC {
-            eprintln!(
-                "[media_engine] PTS jump gede ({:.2}s) kedetect @ ~{:.2}s -- dianggap glitch timestamp (bukan silence asli), pad dibatasin ke {:.1}s biar sisa audio asli abis titik ini tetep sempet ke-decode",
-                raw_gap_sec, shared.position(), MAX_GAP_PAD_SEC,
-            );
+    // 0. FILTER FRAME SEBELUM TARGET SEEK:
+    // Karena avformat_seek_file melompat ke keyframe sebelum target, buang frame audio
+    // yang posisinya masih sebelum titik seek agar suara tidak mendahului/terlambat dari video.
+    if let Some(target_sec) = *audio_skip_until {
+        if let Some(f_pts) = frame_pts {
+            if f_pts + frame_dur <= target_sec {
+                return;
+            }
+            *audio_skip_until = None;
+        } else {
+            *audio_skip_until = None;
         }
-        let gap_sec = raw_gap_sec.min(MAX_GAP_PAD_SEC);
-        let gap_samples = (gap_sec * out_rate as f64) as usize * out_channels as usize;
-        let silence = vec![0.0f32; 2048.min(gap_samples)];
-        let mut pushed_total = 0;
-        let a_cap = (out_rate as usize) * (out_channels as usize) * 2;
+    }
 
-        while pushed_total < gap_samples {
-            if shared.stop.load(Ordering::Relaxed) || shared.audio_flush.load(Ordering::Relaxed) {
-                break;
+    // Inisialisasi expected_audio_pts pada frame pertama yang lolos setelah seek
+    let exp_pts = match *expected_audio_pts {
+        Some(p) => p,
+        None => {
+            let start_p = frame_pts.unwrap_or_else(|| *shared.clock_base_pts.lock().unwrap());
+            // Kuncikan clock_base_pts persis ke PTS frame audio pertama yang benar-benar diputar!
+            if start_p >= 0.0 {
+                *shared.clock_base_pts.lock().unwrap() = start_p;
             }
-            if producer.occupied_len() >= a_cap {
-                thread::sleep(Duration::from_millis(5));
-                continue;
+            *expected_audio_pts = Some(start_p);
+            start_p
+        }
+    };
+
+    // 1. DRIFT & GAP CORRECTION:
+    // Bandingkan PTS frame dengan waktu aktual yang sudah kita dorong ke ring buffer (exp_pts)
+    if let Some(f_pts) = frame_pts {
+        let diff = f_pts - exp_pts;
+        // Jika audio tertinggal > 40ms dari timestamp aslinya (karena gap atau pembulatan frame),
+        // suntikkan silence supaya jam audio & video tetap terkunci rapat.
+        if diff > 0.04 {
+            const MAX_GAP_PAD_SEC: f64 = 30.0;
+            let gap_sec = diff.min(MAX_GAP_PAD_SEC);
+            let ch = out_channels.max(1) as usize;
+            let gap_frames = (gap_sec * out_rate as f64).round() as usize;
+            let gap_samples = gap_frames * ch;
+            let silence = vec![0.0f32; 2048.min(gap_samples.max(ch))];
+            let mut pushed_total = 0;
+            let a_cap = (out_rate as usize) * ch * 2;
+            let current_seq = shared.seek_seq.load(Ordering::SeqCst);
+
+            while pushed_total < gap_samples {
+                if shared.stop.load(Ordering::Relaxed)
+                    || shared.seek_seq.load(Ordering::SeqCst) != current_seq
+                {
+                    break;
+                }
+                if shared.audio_flush.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                if producer.occupied_len() >= a_cap {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                let to_push = (gap_samples - pushed_total).min(silence.len());
+                let pushed = producer.push_slice(&silence[..to_push]);
+                pushed_total += pushed;
+                shared.audio_buffered_hint.store(producer.occupied_len(), Ordering::Relaxed);
             }
-            let to_push = (gap_samples - pushed_total).min(silence.len());
-            let pushed = producer.push_slice(&silence[..to_push]);
-            pushed_total += pushed;
-            shared.audio_buffered_hint.store(producer.occupied_len(), Ordering::Relaxed);
+            *expected_audio_pts = Some(exp_pts + (pushed_total / ch) as f64 / out_rate as f64);
         }
     }
 
     // 2. SETUP RESAMPLER
+    let safe_channels = if decoder_channels > 0 { decoder_channels } else { 2 };
+    let src_layout = if aframe.channel_layout().bits() != 0 {
+        aframe.channel_layout()
+    } else {
+        ffmpeg_next::util::channel_layout::ChannelLayout::default(safe_channels)
+    };
+
+    if aframe.channel_layout().bits() == 0 {
+        aframe.set_channel_layout(src_layout);
+    }
+
     if resampler.is_none() {
-        let src_layout = if aframe.channel_layout().bits() != 0 {
-            aframe.channel_layout()
-        } else {
-            ffmpeg_next::util::channel_layout::ChannelLayout::default(decoder_channels)
-        };
         *resampler = match ffmpeg_next::software::resampling::Context::get(
             aframe.format(), src_layout, aframe.rate(),
             ffmpeg_next::util::format::Sample::F32(ffmpeg_next::util::format::sample::Type::Packed),
@@ -1362,65 +1513,84 @@ fn push_resampled_audio_frame(
         };
     }
 
-    // 3. RESAMPLE & PUSH FRAME AKTUAL (Anti-Drop Backpressure)
+    // 3. RESAMPLE
+    // [FIX GLITCH] Versi sebelumnya manggil `rs.flush()` di TENGAH stream
+    // tiap kali `run()` ngembaliin Some(delay) -- padahal buat konversi
+    // sample-rate (mis. 44.1k -> 48k) delay itu SELALU > 0 (itu cuma sisa
+    // normal filter polyphase swresample, bukan sample "hilang"). flush()
+    // = tanda "stream udah abis": swresample nguras ekor filter + isi nol,
+    // jadi tiap frame (~20 ms) ada diskontinuitas = bunyi "krek"/glitch,
+    // plus jumlah sample yang didorong ikut ngaco (pts audio kebawa).
+    // Akar masalah aslinya (kenapa dulu dikira ada sample hilang ~8%):
+    // `Context::run()` ngalokasi frame output SEBESAR input.samples() kalau
+    // frame-nya kosong, padahal upsampling butuh output LEBIH banyak dari
+    // input -> sisanya nyangkut di buffer internal swresample. Solusinya:
+    // alokasi sendiri frame output yang cukup gede (sisa buffer internal +
+    // input yang di-scale ke out_rate + margin). Sisa delay yang tersisa
+    // otomatis keluar di panggilan run() berikutnya, nyambung mulus tanpa
+    // flush. (swr_convert_frame ngeset nb_samples ke jumlah aktual.)
+    let mut do_resample_and_push = |rs: &mut ffmpeg_next::software::resampling::Context,
+                                    aframe: &ffmpeg_next::frame::Audio|
+     -> Result<usize, ffmpeg_next::Error> {
+        let in_rate = (rs.input().rate as u64).max(1);
+        let o_rate = rs.output().rate as u64;
+        let buffered = rs.delay().map(|d| d.output.max(0) as u64).unwrap_or(0);
+        let needed = buffered + (aframe.samples() as u64 * o_rate + in_rate - 1) / in_rate + 64;
+        let mut resampled = ffmpeg_next::frame::Audio::new(
+            ffmpeg_next::util::format::Sample::F32(ffmpeg_next::util::format::sample::Type::Packed),
+            needed as usize,
+            out_layout,
+        );
+        rs.run(aframe, &mut resampled)?;
+
+        let ch = out_channels.max(1) as usize;
+        let n_samples = resampled.samples() * ch;
+        let raw = resampled.data(0);
+        let mut total_frames_pushed = 0usize;
+        if n_samples > 0 && raw.len() >= n_samples * 4 {
+            let floats: &[f32] = unsafe {
+                std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_samples)
+            };
+            total_frames_pushed += push_floats_to_ring(floats, producer, shared, out_rate, out_channels);
+        }
+        Ok(total_frames_pushed)
+    };
+
+    let mut frames_written = 0usize;
     if let Some(rs) = resampler.as_mut() {
-        let mut resampled = ffmpeg_next::frame::Audio::empty();
-        match rs.run(aframe, &mut resampled) {
-            Ok(_) => {
-                let n_samples = resampled.samples() * out_channels as usize;
-                let raw = resampled.data(0);
-                if raw.len() >= n_samples * 4 {
-                    let floats: &[f32] = unsafe {
-                        std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_samples)
-                    };
-
-                    // [BARU] Downmix ke mono & simpen ke viz_ring buat FFT
-                    // visualizer. Ini SELALU jalan (gak peduli backpressure
-                    // ring buffer playback di bawah) karena tujuannya cuma
-                    // nampilin "apa yang lagi didecode sekarang", bukan
-                    // ikut aturan sinkronisasi audio-video.
-                    {
-                        let ch = out_channels as usize;
-                        let mut viz = shared.viz_ring.lock().unwrap();
-                        for frame in floats.chunks(ch) {
-                            let mono = frame.iter().sum::<f32>() / ch as f32;
-                            viz.push_back(mono);
-                        }
-                        while viz.len() > VIZ_RING_CAP {
-                            viz.pop_front();
-                        }
-                    }
-
-                    let mut pushed_total = 0;
-                    let a_cap = (out_rate as usize) * (out_channels as usize) * 2;
-
-                    // Loop ini menjamin tidak ada 1 sampel pun yang dibuang saat ring buffer penuh
-                    while pushed_total < n_samples {
-                        if shared.stop.load(Ordering::Relaxed) || shared.audio_flush.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        if producer.occupied_len() >= a_cap {
-                            thread::sleep(Duration::from_millis(5));
-                            continue;
-                        }
-                        let chunk = &floats[pushed_total..];
-                        let pushed = producer.push_slice(chunk);
-                        pushed_total += pushed;
-                        shared.audio_buffered_hint.store(producer.occupied_len(), Ordering::Relaxed);
-                    }
-                }
-            }
+        match do_resample_and_push(rs, aframe) {
+            Ok(n) => frames_written = n,
             Err(e) => {
-                eprintln!("[media_engine] resample audio gagal @ ~{:.2}s: {e}", shared.position());
+                eprintln!(
+                    "[media_engine] resample audio gagal @ ~{:.2}s: {e} -- rebuild resampler & retry sekali",
+                    shared.position(),
+                );
+                if let Ok(mut new_rs) = ffmpeg_next::software::resampling::Context::get(
+                    aframe.format(), src_layout, aframe.rate(),
+                    ffmpeg_next::util::format::Sample::F32(ffmpeg_next::util::format::sample::Type::Packed),
+                    out_layout, out_rate,
+                ) {
+                    if let Ok(n) = do_resample_and_push(&mut new_rs, aframe) {
+                        frames_written = n;
+                    }
+                    *resampler = Some(new_rs);
+                }
             }
         }
     }
 
-    // 4. UPDATE EXPECTED PTS UNTUK ITERASI BERIKUTNYA
-    let duration_sec = aframe.samples() as f64 / aframe.rate() as f64;
-    *expected_audio_pts = frame_pts + duration_sec;
+    // 4. UPDATE EXPECTED PTS BERDASARKAN JUMLAH SAMPLE AKTUAL YANG MASUK KE RING BUFFER
+    // Ini memastikan expected_audio_pts berjalan 1:1 dengan audio_frames_played di cpal!
+    if let Some(curr) = *expected_audio_pts {
+        *expected_audio_pts = Some(curr + (frames_written as f64 / out_rate as f64));
+    }
 }
 
+/// Loop thread AUDIO: demux+decode audio dari file handle-nya SENDIRI,
+/// resample ke format device, dorong ke ring buffer. Sama sekali gak
+/// nyentuh video_q -- itu urusan video_decode_loop(). Backpressure &
+/// seek-nya independen total dari video, jadi video yang lagi berat gak
+/// akan pernah bisa bikin thread ini (dan ring buffer-nya) ke-block.
 fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: AudioProducer) {
     let path = Path::new(&file_path);
     let mut input_ctx = match ffmpeg_next::format::input(&path) {
@@ -1436,8 +1606,6 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
         None => return,
     };
 
-    // Time base stream audio -- dipakai buat konversi PTS mentah (dalam unit
-    // stream) ke detik, biar bisa dibandingin sama expected_audio_pts.
     let atb = {
         let s = input_ctx.streams().best(ffmpeg_next::media::Type::Audio).unwrap();
         let tb = s.time_base();
@@ -1458,23 +1626,15 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
     let out_rate = shared.out_sample_rate.load(Ordering::Relaxed) as u32;
     let out_channels = shared.out_channels.load(Ordering::Relaxed) as u16;
     let out_layout = ffmpeg_next::util::channel_layout::ChannelLayout::default(out_channels as i32);
-    let a_cap = (out_rate as usize) * (out_channels as usize) * 2; // ~2 detik, sama kayak sebelumnya
+    let a_cap = (out_rate as usize) * (out_channels as usize) * 2;
 
-    // State tracker: PTS (dalam detik) yang "seharusnya" terjadi berikutnya
-    // di ring buffer, dipakai buat deteksi gap (start delay / bolong di
-    // tengah) dan nyuntik silence biar timeline audio gak geser ke kiri.
-    let mut expected_audio_pts: f64 = 0.0;
-
+    let mut expected_audio_pts: Option<f64> = None;
+    let mut audio_skip_until: Option<f64> = None;
     let mut resampler: Option<ffmpeg_next::software::resampling::Context> = None;
     let mut aframe = ffmpeg_next::frame::Audio::empty();
     let mut applied_seek_seq: u64 = 0;
     let mut sent_eof = false;
 
-    // Sama kayak video_decode_loop: SATU iterator, dipakai berulang, cuma
-    // dibikin ulang pas ada seek. Lihat comment lebih lengkap di
-    // video_decode_loop soal kenapa ini penting.
-    // [FIX] Sama kayak di video_decode_loop -- assignment ke None di bawah
-    // sengaja buat lepas borrow sebelum seek(), bukan gak kepake.
     #[allow(unused_assignments)]
     let mut packet_iter = Some(input_ctx.packets());
 
@@ -1485,24 +1645,22 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
 
         let current_seq = shared.seek_seq.load(Ordering::SeqCst);
         if current_seq != applied_seek_seq {
-            packet_iter = None; // lepas borrow dulu biar input_ctx bisa dipinjem buat seek()
+            packet_iter = None;
             let sec = *shared.seek_target.lock().unwrap();
             let ts = av_time_base_ts(sec);
-            if input_ctx.seek(ts, ..ts).is_ok() {
-                adecoder.flush();
-                // reset_clock() aman dipanggil dari kedua thread (video
-                // JUGA manggil ini buat generation yg sama) -- idempotent,
-                // nulis base+flush yang sama, gak ada efek dobel.
-                shared.reset_clock(sec);
-                sent_eof = false;
-            }
+            let _ = input_ctx.seek(ts, ..ts);
+            adecoder.flush();
+            resampler = None; // Reset resampler agar sisa sampel sebelum seek terbuang bersih
+            sent_eof = false;
+            shared.audio_eof.store(false, Ordering::Relaxed);
+            // Pastikan cpal callback menguras habis ringbuffer sebelum sampel baru didorong
+            shared.audio_flush.store(true, Ordering::SeqCst);
+            shared.audio_buffered_hint.store(0, Ordering::SeqCst);
             packet_iter = Some(input_ctx.packets());
             applied_seek_seq = current_seq;
-
-            // Abis seek, expected PTS harus di-reset ke target seek --
-            // kalau enggak, frame pertama setelah seek bakal keliatan
-            // "gap" palsu dibanding posisi lama.
-            expected_audio_pts = sec;
+            expected_audio_pts = None;
+            audio_skip_until = Some(sec);
+            shared.audio_acked_seq.store(current_seq, Ordering::SeqCst);
         }
 
         if !shared.playing.load(Ordering::Relaxed) {
@@ -1522,32 +1680,22 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
                 if !sent_eof {
                     let _ = adecoder.send_eof();
                     sent_eof = true;
-                    // [FIX] send_eof() naruh decoder ke mode "draining" --
-                    // WAJIB terus manggil receive_frame() sampe dia gak
-                    // ngasih frame lagi, buat ngeluarin sisa frame yg masih
-                    // ke-buffer internal (decode delay/reorder, umum di
-                    // AAC/Opus dll). Sebelumnya ini gak dipanggil sama
-                    // sekali abis send_eof() -- makanya audio berhenti
-                    // KEDENGERAN lebih awal drpd posisi EOF fisik yang
-                    // dilog di bawah (buffer di ring buffer, yg diisi dari
-                    // sample2 sebelum EOF, keburu abis sebelum sample2 sisa
-                    // hasil drain ini nyampe -- padahal seharusnya ada).
                     while adecoder.receive_frame(&mut aframe).is_ok() {
+                        if shared.seek_seq.load(Ordering::SeqCst) != applied_seek_seq {
+                            break;
+                        }
                         push_resampled_audio_frame(
-                            &aframe, &mut resampler, &mut producer, &shared,
+                            &mut aframe, &mut resampler, &mut producer, &shared,
                             adecoder.channels() as i32, out_layout, out_rate, out_channels,
-                            &mut expected_audio_pts, atb,
+                            &mut expected_audio_pts, &mut audio_skip_until, atb,
                         );
                     }
                     eprintln!(
-                        "[media_engine] audio thread nyampe EOF file fisik (udah di-drain) @ posisi ~{:.2}s (kalau ini muncul jauh sebelum durasi video abis, kemungkinan track audio di file emang lebih pendek drpd video, bukan bug decode)",
+                        "[media_engine] audio thread nyampe EOF file fisik (udah di-drain) @ posisi ~{:.2}s",
                         shared.position(),
                     );
+                    shared.audio_eof.store(true, Ordering::Relaxed);
                 }
-                // EOF di sisi audio gak nge-trigger apa2 (bukan yg megang
-                // status "selesai" buat UI, itu video_decode_loop). Kalau
-                // loop_enabled, video yang bakal bump seek_seq -- thread
-                // ini otomatis ikut nangkep lewat cek generation di atas.
                 thread::sleep(Duration::from_millis(20));
                 continue;
             }
@@ -1562,15 +1710,17 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
             continue;
         }
         while adecoder.receive_frame(&mut aframe).is_ok() {
+            if shared.seek_seq.load(Ordering::SeqCst) != applied_seek_seq {
+                break;
+            }
             push_resampled_audio_frame(
-                &aframe, &mut resampler, &mut producer, &shared,
+                &mut aframe, &mut resampler, &mut producer, &shared,
                 adecoder.channels() as i32, out_layout, out_rate, out_channels,
-                &mut expected_audio_pts, atb,
+                &mut expected_audio_pts, &mut audio_skip_until, atb,
             );
         }
     }
 }
-
 
 fn scale_to_rgb(
     decoded: &ffmpeg_next::frame::Video,
@@ -1653,12 +1803,28 @@ fn decode_audio_mono(file_path: &str, out_rate: u32) -> PyResult<Vec<f32>> {
     // format decoder kadang beda dari yang dilaporin stream parameters.
     macro_rules! resample_and_push {
         ($frame:expr) => {{
+            // [FIX] Sama kayak di push_resampled_audio_frame -- jaga2
+            // kalau decoder.channels() masih 0 di frame pertama (MP3
+            // dengan ID3v2/Xing header gede).
+            let ch = decoder.channels() as i32;
+            let safe_channels = if ch > 0 { ch } else { 2 };
+            let src_layout = if $frame.channel_layout().bits() != 0 {
+                $frame.channel_layout()
+            } else {
+                ffmpeg_next::util::channel_layout::ChannelLayout::default(safe_channels)
+            };
+
+            // [FIX BARU] Sama persis kasusnya kayak push_resampled_audio_frame:
+            // decoder PCM mentah (WAV) sering ninggalin channel_layout MENTAH
+            // si frame = 0, dan itu yang divalidasi swr_convert_frame() lewat
+            // Context::run() -- BUKAN cuma src_layout lokal di atas. Kalau gak
+            // dipatch di frame-nya sendiri, file WAV pendek/aneh bisa gagal
+            // total dianalisa (envelope waveform kosong / BPM ke-detect 0).
+            if $frame.channel_layout().bits() == 0 {
+                $frame.set_channel_layout(src_layout);
+            }
+
             if resampler.is_none() {
-                let src_layout = if $frame.channel_layout().bits() != 0 {
-                    $frame.channel_layout()
-                } else {
-                    ffmpeg_next::util::channel_layout::ChannelLayout::default(decoder.channels() as i32)
-                };
                 resampler = ffmpeg_next::software::resampling::Context::get(
                     $frame.format(), src_layout, $frame.rate(),
                     ffmpeg_next::util::format::Sample::F32(ffmpeg_next::util::format::sample::Type::Packed),
@@ -1685,7 +1851,7 @@ fn decode_audio_mono(file_path: &str, out_rate: u32) -> PyResult<Vec<f32>> {
         if stream.index() != audio_idx { continue; }
         if decoder.send_packet(&packet).is_err() { continue; }
         while decoder.receive_frame(&mut decoded).is_ok() {
-            resample_and_push!(&decoded);
+            resample_and_push!(&mut decoded);
         }
     }
     // Drain sisa frame yang masih ke-buffer internal decoder (decode
@@ -1693,7 +1859,7 @@ fn decode_audio_mono(file_path: &str, out_rate: u32) -> PyResult<Vec<f32>> {
     // ilang dari hasil analisa, sama kayak catatan di audio_decode_loop().
     let _ = decoder.send_eof();
     while decoder.receive_frame(&mut decoded).is_ok() {
-        resample_and_push!(&decoded);
+        resample_and_push!(&mut decoded);
     }
 
     Ok(samples)
