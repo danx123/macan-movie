@@ -1,19 +1,29 @@
 [package]
 name = "media_engine"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 
 [dependencies]
-pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310", "generate-import-lib"] }
-numpy = "0.29"
-ndarray = "0.15"
+pyo3 = { version = "0.29.2", features = ["extension-module", "abi3-py310", "generate-import-lib"] }
+numpy = "0.29.0"
+# [UPDATE] 0.15 -> 0.17. numpy 0.29 sendiri nge-declare `ndarray = ">=0.15,
+# <=0.17"`, jadi 0.17 masih dalam rentang yang didukung (gak perlu ganti API
+# pemakaian Array1/Array3::from_vec/from_shape_vec, itu stabil di rentang ini).
+ndarray = "0.17"
 
 # [BARU] Output audio cross-platform. Di Windows dia otomatis pakai backend
 # WASAPI (murni lewat COM/windows-sys, gak butuh header/lib C tambahan),
 # jadi aman buat cross-compile dari Linux target x86_64-pc-windows-gnu.
 # Kalau mau lint/build lokal di Linux (bukan cross-compile), backend ALSA
 # butuh `libasound2-dev` kepasang di mesin coding.
-cpal = "0.15"
+#
+# [UPDATE] 0.15 -> 0.18. Breaking change yang KENA di kode kita: `SampleRate`
+# berubah dari tuple struct jadi type alias `u32` sejak 0.17 -- pemanggilan
+# `cfg.sample_rate().0` di lib.rs (setup PlayerEngine) sudah disesuaikan jadi
+# `cfg.sample_rate()` langsung (lihat lib.rs). Signature `build_output_stream`
+# (4 argumen termasuk `None` di akhir buat timeout) TIDAK berubah dari yang
+# sudah dipakai kode kita, jadi gak perlu disentuh.
+cpal = "0.18"
 
 # [BARU] Ring buffer SPSC lock-free buat nampung sample audio antara decode
 # thread (producer) dan callback audio cpal (consumer). Sebelumnya pakai
@@ -21,23 +31,48 @@ cpal = "0.15"
 # callback rawan bikin glitch/krek-krek kalau kebetulan lagi dipegang decode
 # thread pas callback butuh jalan (apalagi kalau sampe ada realokasi Vec di
 # baliknya). Ring buffer SPSC gak butuh lock sama sekali buat push/pop.
-ringbuf = "0.4"
+# [UPDATE] 0.4 -> 0.5. API `HeapRb::<f32>::new()`, `.split()` -> (HeapProd,
+# HeapCons), dan `traits::{Consumer, Producer, Observer, Split}` yang dipakai
+# di lib.rs PERSIS sama di 0.5 -- gak ada penyesuaian kode yang diperlukan.
+ringbuf = "0.5"
 
 # [BARU] FFT buat fitur FFT visualizer (analisa spektrum frekuensi real-time
 # dari buffer audio yang lagi diputer PlayerEngine, lihat viz_ring/get_spectrum).
-rustfft = "6.2"
+rustfft = "6.4"
 
 # [BARU] Dipakai buat paralelkan komputasi CPU-bound yang gampang di-chunk:
 # envelope waveform (RMS per-segmen) dan autocorrelation buat BPM detection.
 # Pattern-nya sama kayak modul audio cutter/tag editor -- rayon bikin ini
 # jalan multi-core tanpa perlu urus thread pool manual sendiri.
-rayon = "1.10"
+rayon = "1.12"
 
+# [UPDATE] 7.1 -> 9.0. Versioning crate ini ngikutin versi major.minor
+# FFmpeg-nya sendiri (9.0.0 = dukungan resmi buat FFmpeg n9.0), makanya
+# build.yml juga WAJIB ikut dinaikin FFMPEG_TAG-nya ke n9.0 (sudah
+# disesuaikan di sana). Sudah dicek CHANGELOG.md crate ini sampai rilis
+# 9.0.0: satu-satunya breaking change tercatat ("Unreleased": Rc->Arc di
+# keep-alive internal format context) cuma berdampak ke signature unsafe
+# wrap()/destructor kustom yang TIDAK dipakai di lib.rs kita (kita cuma
+# pakai API aman: format::input, Context::from_parameters, decoder/encoder
+# send_packet/receive_frame dkk, scaling::Context, resampling::Context) --
+# jadi gak ada penyesuaian kode di lib.rs buat bagian ffmpeg-next-nya.
+# Nama fitur ("static"/"build"/"codec"/"format"/"software-resampling"/
+# "software-scaling") juga masih sama persis di 9.0.0.
+#
+# CATATAN buat Winda: FFmpeg 9.0 defaultnya udah verifikasi sertifikat TLS
+# buat koneksi https (dulu opsional). Kalau nanti PlayerEngine dipakai buat
+# streaming radio/podcast lewat https ke server yang sertifikatnya
+# self-signed/gak lengkap, itu bisa mulai gagal connect -- ini di luar
+# scope update versi ini (configure FFmpeg di build.yml juga belum
+# nge-enable backend TLS apapun/openssl-gnutls, jadi https:// kemungkinan
+# emang belum pernah jalan di build Windows-nya), tapi worth di-cek kalau
+# ada laporan radio/podcast gagal connect abis update ini.
+#
 # Non-Windows (mis. lint/test lokal di Linux/macOS): ffmpeg-sys-next boleh
 # pakai feature "build"-nya sendiri buat compile FFmpeg dari source, karena
 # di situ TARGET == HOST jadi gak kena bug cross-compile target_os di bawah.
 [target.'cfg(not(windows))'.dependencies]
-ffmpeg-next = { version = "7.1", default-features = false, features = [
+ffmpeg-next = { version = "9.0", default-features = false, features = [
     "static",
     "build",
     "codec",
@@ -47,13 +82,14 @@ ffmpeg-next = { version = "7.1", default-features = false, features = [
 ] }
 
 # Windows (native ATAU cross-compile dari Linux): TIDAK pakai feature "build".
-# ffmpeg-sys-next versi 7.x salah kirim --target_os=windows ke `configure`
-# FFmpeg pas cross-compile (harusnya mingw32/mingw64), jadi configure-nya
-# selalu gagal dengan "Unknown OS 'windows'". Solusinya: FFmpeg dikompilasi
-# manual di CI (lihat build.yml) dengan --target-os=mingw32 yang benar, lalu
-# ffmpeg-sys-next diarahkan ke situ lewat env var FFMPEG_DIR.
+# ffmpeg-sys-next salah kirim --target_os=windows ke `configure` FFmpeg pas
+# cross-compile (harusnya mingw32/mingw64), jadi configure-nya selalu gagal
+# dengan "Unknown OS 'windows'" -- bug ini independen dari versi FFmpeg-nya
+# sendiri (masih ada di 9.0.0). Solusinya: FFmpeg dikompilasi manual di CI
+# (lihat build.yml) dengan --target-os=mingw32 yang benar, lalu ffmpeg-sys-next
+# diarahkan ke situ lewat env var FFMPEG_DIR.
 [target.'cfg(windows)'.dependencies]
-ffmpeg-next = { version = "7.1", default-features = false, features = [
+ffmpeg-next = { version = "9.0", default-features = false, features = [
     "static",
     "codec",
     "format",
