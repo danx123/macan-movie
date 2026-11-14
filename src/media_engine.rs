@@ -399,6 +399,60 @@ fn rgb_from_decoded(
 }
 
 // ═══════════════════════════════════════════════
+// EQUALIZER 10-band (biquad peaking, RBJ cookbook) -- layout band & Q
+// disamakan dengan macan_equalizer.py (BAND_FREQS / Q_FACTOR) dan libVLC.
+// ═══════════════════════════════════════════════
+
+const EQ_BANDS: usize = 10;
+const EQ_FREQS: [f64; EQ_BANDS] = [60.0, 170.0, 310.0, 600.0, 1000.0, 3000.0, 6000.0, 12000.0, 14000.0, 16000.0];
+const EQ_Q: f64 = 1.41;
+
+/// Snapshot parameter EQ. `bands` cuma berisi band AKTIF (gain != 0) di
+/// `bands[..n]`, tiap entri = [b0, b1, b2, a1, a2] (sudah dibagi a0).
+#[derive(Clone, Copy)]
+struct EqState {
+    enabled: bool,
+    preamp: f32, // linear
+    n: usize,
+    bands: [[f64; 5]; EQ_BANDS],
+}
+
+impl Default for EqState {
+    fn default() -> Self {
+        EqState { enabled: false, preamp: 1.0, n: 0, bands: [[0.0; 5]; EQ_BANDS] }
+    }
+}
+
+fn peaking_coeffs(fc: f64, gain_db: f64, q: f64, fs: f64) -> [f64; 5] {
+    let a = 10f64.powf(gain_db / 40.0);
+    let w0 = 2.0 * std::f64::consts::PI * fc / fs;
+    let alpha = w0.sin() / (2.0 * q);
+    let cosw = w0.cos();
+    let b0 = 1.0 + alpha * a;
+    let b1 = -2.0 * cosw;
+    let b2 = 1.0 - alpha * a;
+    let a0 = 1.0 + alpha / a;
+    let a1 = -2.0 * cosw;
+    let a2 = 1.0 - alpha / a;
+    [b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0]
+}
+
+fn build_eq_state(gains: &[f32], preamp_db: f32, enabled: bool, fs: f64) -> EqState {
+    let mut st = EqState::default();
+    st.enabled = enabled;
+    st.preamp = 10f32.powf(preamp_db.clamp(-20.0, 20.0) / 20.0);
+    for (i, fc) in EQ_FREQS.iter().enumerate() {
+        let g = gains.get(i).copied().unwrap_or(0.0).clamp(-20.0, 20.0) as f64;
+        if g.abs() < 1e-3 || *fc >= 0.45 * fs {
+            continue;
+        }
+        st.bands[st.n] = peaking_coeffs(*fc, g, EQ_Q, fs);
+        st.n += 1;
+    }
+    st
+}
+
+// ═══════════════════════════════════════════════
 // BAGIAN 3: PLAYER ENGINE — decode+audio jalan di thread sendiri,
 // audio dipakai sebagai master clock, video di-sync ke clock itu.
 // ═══════════════════════════════════════════════
@@ -455,6 +509,13 @@ struct Shared {
     // volume yg sama pas di-unmute).
     volume_bits: AtomicU32,
     muted: AtomicBool,
+
+    // [BARU] Equalizer 10-band (peaking biquad) + preamp. Koefisien dihitung
+    // di thread Python (set_equalizer) lalu dititipkan di eq_params; audio
+    // callback cpal cuma nyalin pas eq_seq berubah, pakai try_lock() --
+    // callback real-time TIDAK PERNAH nge-block nunggu lock.
+    eq_params: Mutex<EqState>,
+    eq_seq: AtomicU64,
 
     // Mekanisme seek pakai "generation counter", BUKAN Option<f64> yang
     // di-`take()` -- itu cuma bisa dikonsumsi SEKALI sama SATU pembaca.
@@ -653,6 +714,8 @@ impl PlayerEngine {
             has_audio: AtomicBool::new(has_audio),
             volume_bits: AtomicU32::new(1.0f32.to_bits()),
             muted: AtomicBool::new(false),
+            eq_params: Mutex::new(EqState::default()),
+            eq_seq: AtomicU64::new(0),
             seek_seq: AtomicU64::new(0),
             video_acked_seq: AtomicU64::new(0),
             audio_acked_seq: AtomicU64::new(0),
@@ -698,6 +761,15 @@ impl PlayerEngine {
                     let stream_cfg: cpal::StreamConfig = cfg.clone().into();
                     let shared_cb = Arc::clone(&shared);
 
+                    // [BARU] State EQ lokal milik audio callback (dialokasi
+                    // di sini, BUKAN di dalam callback): history biquad
+                    // (z1, z2) per channel per band, snapshot parameter
+                    // terakhir, dan versi (eq_seq) yang terakhir dibaca.
+                    let eq_ch = (channels as usize).max(1);
+                    let mut eq_hist: Vec<[f64; 2]> = vec![[0.0; 2]; eq_ch * EQ_BANDS];
+                    let mut eq_local = EqState::default();
+                    let mut eq_seen: u64 = 0;
+
                     // [UPDATE cpal 0.18] Sejak 0.18 semua enum error per-operasi
                     // (BuildStreamError, StreamError, dkk) udah dilebur jadi satu
                     // `cpal::Error` (gak ada varian publik yang bisa dikonstruksi
@@ -713,6 +785,9 @@ impl PlayerEngine {
                                 if shared_cb.audio_flush.swap(false, Ordering::SeqCst) {
                                     while consumer.try_pop().is_some() {}
                                     shared_cb.audio_buffered_hint.store(0, Ordering::SeqCst);
+                                    // Timeline loncat (seek): buang history filter biar
+                                    // ekor audio lama gak "bocor" ke posisi baru.
+                                    for h in eq_hist.iter_mut() { *h = [0.0; 2]; }
                                     for sample in data.iter_mut() {
                                         *sample = 0.0;
                                     }
@@ -722,9 +797,37 @@ impl PlayerEngine {
                                 let vol = shared_cb.effective_volume();
                                 let mut popped_samples = 0usize;
 
-                                for sample in data.iter_mut() {
+                                // Ambil parameter EQ terbaru kalau ada perubahan.
+                                // try_lock: kalau lagi dipegang thread Python, coba
+                                // lagi di callback berikutnya (gak pernah block).
+                                let seq = shared_cb.eq_seq.load(Ordering::Acquire);
+                                if seq != eq_seen {
+                                    if let Ok(g) = shared_cb.eq_params.try_lock() {
+                                        eq_local = *g;
+                                        eq_seen = seq;
+                                    }
+                                }
+                                let eq_active = eq_local.enabled
+                                    && (eq_local.n > 0 || (eq_local.preamp - 1.0).abs() > 1e-6);
+
+                                for (i, sample) in data.iter_mut().enumerate() {
                                     if let Some(s) = consumer.try_pop() {
-                                        *sample = s * vol;
+                                        let mut v = s;
+                                        if eq_active {
+                                            let c = i % eq_ch;
+                                            let hist = &mut eq_hist[c * EQ_BANDS..(c + 1) * EQ_BANDS];
+                                            let mut x = (s * eq_local.preamp) as f64;
+                                            for b in 0..eq_local.n {
+                                                let k = &eq_local.bands[b];
+                                                // Transposed Direct Form II
+                                                let y = k[0] * x + hist[b][0];
+                                                hist[b][0] = k[1] * x - k[3] * y + hist[b][1];
+                                                hist[b][1] = k[2] * x - k[4] * y;
+                                                x = y;
+                                            }
+                                            v = (x as f32).clamp(-1.0, 1.0);
+                                        }
+                                        *sample = v * vol;
                                         popped_samples += 1;
                                     } else {
                                         *sample = 0.0;
@@ -959,6 +1062,24 @@ impl PlayerEngine {
 
     fn is_muted(&self) -> bool {
         self.shared.muted.load(Ordering::Relaxed)
+    }
+
+    /// [BARU] Equalizer 10-band + preamp, real-time di audio callback.
+    /// `gains` = gain dB per band (60, 170, 310, 600, 1k, 3k, 6k, 12k, 14k,
+    /// 16k Hz), rentang -20..+20 dB; `preamp` dB. Aman dipanggil kapan saja
+    /// (termasuk saat playing). `enabled=false` = bypass total.
+    #[pyo3(signature = (gains, preamp=0.0, enabled=true))]
+    fn set_equalizer(&mut self, gains: Vec<f32>, preamp: f32, enabled: bool) {
+        let fs = self.shared.out_sample_rate.load(Ordering::Relaxed).max(1) as f64;
+        let st = build_eq_state(&gains, preamp, enabled, fs);
+        *self.shared.eq_params.lock().unwrap() = st;
+        self.shared.eq_seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// [BARU] Matikan equalizer (bypass, audio lewat apa adanya).
+    fn clear_equalizer(&mut self) {
+        *self.shared.eq_params.lock().unwrap() = EqState::default();
+        self.shared.eq_seq.fetch_add(1, Ordering::Release);
     }
 
     fn is_eof(&self) -> bool {
