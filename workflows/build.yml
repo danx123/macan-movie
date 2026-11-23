@@ -10,25 +10,11 @@ jobs:
     name: Cross-compile Windows wheel (abi3)
     runs-on: ubuntu-latest
     env:
-      # [UPDATE] Samakan minor version FFmpeg dengan `ffmpeg-next = "9.0"` di
-      # Cargo.toml (sudah dinaikin bareng, lihat komentar [UPDATE] di sana).
-      # ffmpeg-next punya banyak `match` Rust manual (pixel format, codec ID,
-      # dll) yang di-generate/di-maintain untuk rentang versi tertentu --
-      # kalau FFmpeg yang dikompilasi lebih baru dari yang crate-nya dukung
-      # dan menambah varian enum baru, bindgen ikut memasukkannya ke
-      # bindings.rs, tapi match statement di ffmpeg-next belum kenal varian
-      # itu -> compile error E0004 "non-exhaustive patterns". Kalau nanti
-      # mau naik lagi ke versi FFmpeg berikutnya, naikkan juga `ffmpeg-next`
-      # (dan `ffmpeg-sys-next` transitif-nya) ke versi yang sudah support
-      # versi itu secara eksplisit dulu, jangan cuma ganti tag ini sendirian.
       FFMPEG_TAG: n9.0
 
     steps:
       - uses: actions/checkout@v4
 
-      # 🧱 mingw-w64 = compiler + linker buat target Windows.
-      # Paket -posix WAJIB dipilih (bukan -win32) karena FFmpeg butuh pthreads,
-      # dan varian -win32 mingw-w64 default di Ubuntu gak punya itu.
       - name: Pasang toolchain cross mingw-w64
         run: |
           sudo apt-get update
@@ -58,34 +44,12 @@ jobs:
       - name: Pasang Meson & Ninja (buat libdav1d)
         run: pip install meson ninja
 
-      # 💾 [BARU] Cache hasil build statis FFmpeg (+ libdav1d + libmp3lame +
-      # libogg + libvorbis) antar-run. Compile FULL FFmpeg dari nol (semua
-      # codec/format aktif, gak dibatasi --disable-everything) di runner
-      # 2 core kadang mepet/lewat batas timeout 40 menit -- ini salah satu
-      # penyebab build "kadang gagal kadang enggak" tanpa error yang
-      # konsisten. Key cache ikut FFMPEG_TAG + isi konfigurasi cross-compile
-      # (lewat hash file ini sendiri), jadi otomatis invalidate kalau
-      # tag/flag configure di atas diubah.
-      #
-      # [FIX] Step ini SENGAJA dipindah ke atas, SEBELUM step libdav1d &
-      # libmp3lame di bawah. Sebelumnya step ini ada di bawah step libdav1d,
-      # padahal step libdav1d punya `if: steps.ffmpeg-cache.outputs.cache-hit
-      # != 'true'` -- referensi ke output step yang BELUM jalan itu resolve
-      # ke string kosong, jadi kondisinya selalu true (libdav1d selalu
-      # dikompilasi ulang tiap run, cache-nya gak pernah benar-benar
-      # kepakai buat skip step itu). Sekarang id `ffmpeg-cache` sudah
-      # ke-set duluan sebelum dipakai di step manapun di bawahnya.
       - name: 💾 Cache FFmpeg hasil cross-compile
         id: ffmpeg-cache
         uses: actions/cache@v4
         with:
           path: ~/ffmpeg-windows
-          # [UPDATE] v18 -> v19: naikin suffix cache-key biar cache lama
-          # (hasil build FFmpeg n7.1) gak ke-reuse keliru buat FFMPEG_TAG
-          # n9.0 yang baru -- walau FFMPEG_TAG sudah ikut di key, nomor versi
-          # ini dinaikin manual tiap kali konfigurasi/versi FFmpeg-nya lompat
-          # signifikan (biar gampang dibedain di tab cache Actions).
-          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v23-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
+          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v26-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
 
       - name: 🎬 Kompilasi libdav1d statis (cross ke Windows)
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
@@ -93,7 +57,6 @@ jobs:
           git clone --depth 1 https://code.videolan.org/videolan/dav1d.git dav1d-src
           cd dav1d-src
           
-          # Bikin file konfigurasi cross-compile buat Meson
           cat <<EOF > cross_file.txt
           [binaries]
           c = 'x86_64-w64-mingw32-gcc-posix'
@@ -110,20 +73,10 @@ jobs:
           endian = 'little'
           EOF
           
-          # Setup build statis dan install ke folder prefix yang sama kayak FFmpeg
           meson setup build --cross-file cross_file.txt --default-library static --prefix="$HOME/ffmpeg-windows" --libdir="lib"
           ninja -C build
           ninja -C build install
 
-      # 🎼 [BARU] Kompilasi libmp3lame statis (cross ke Windows). FFmpeg TIDAK
-      # punya native MP3 encoder built-in -- satu-satunya cara encode ke MP3
-      # itu lewat libmp3lame (external, lisensi LGPL jadi TIDAK perlu
-      # --enable-gpl). Tanpa step ini, encoder "libmp3lame" yang dipakai
-      # media_engine.convert_media() buat format .mp3 gagal runtime dengan
-      # "Encoder audio 'libmp3lame' tidak ditemukan/tidak dikompilasi di
-      # FFmpeg" -- itu penyebab persis error yang dilaporkan Jenny.
-      # LAME pakai autotools biasa (bukan Meson/CMake kayak dav1d), support
-      # cross-compile langsung lewat --host.
       - name: 🎼 Kompilasi libmp3lame statis (cross ke Windows)
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         run: |
@@ -141,20 +94,6 @@ jobs:
           make -j"$(nproc)"
           make install
 
-      # 🎵 [BARU] Kompilasi libogg + libvorbis statis (cross ke Windows).
-      # Sama seperti kasus libmp3lame: FFmpeg gak punya native OGG/Vorbis
-      # encoder, satu-satunya jalan encode ke .ogg itu lewat libvorbis
-      # (yang sendirinya butuh libogg buat container-nya). Tanpa dua lib
-      # ini, "ogg" -> "libvorbis" di AUDIO_CODEC_BY_FORMAT
-      # (macan_audio_converter.py) bakal gagal runtime dengan error yang
-      # persis sama kelasnya kayak libmp3lame kemarin.
-      #
-      # Beda dengan LAME, libogg & libvorbis (autotools, bukan Meson) SAMA-
-      # SAMA generate file .pc (ogg.pc, vorbis.pc, vorbisenc.pc) pas
-      # `make install` -- jadi cukup diarahkan lewat PKG_CONFIG_PATH,
-      # gak perlu --extra-cflags/--extra-ldflags manual kayak lame.
-      # Urutan WAJIB: libogg dulu baru libvorbis (libvorbis --with-ogg
-      # butuh libogg sudah ke-install di prefix yang sama).
       - name: 🎵 Kompilasi libogg statis (cross ke Windows)
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         run: |
@@ -189,11 +128,7 @@ jobs:
 
           make -j"$(nproc)"
           make install
-      # FFmpeg pas dia yang nge-drive proses cross-compile ("Unknown OS
-      # 'windows'"). Makanya FFmpeg dikompilasi manual di sini dengan
-      # --target-os=mingw32 yang benar, lalu ffmpeg-sys-next tinggal diarahkan
-      # ke hasilnya lewat FFMPEG_DIR (lihat Cargo.toml: feature "build" udah
-      # dimatiin khusus buat target Windows).
+
       - name: 🎬 Kompilasi FFmpeg statis (cross ke Windows, target-os=mingw32)
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         timeout-minutes: 40
@@ -203,39 +138,6 @@ jobs:
           
           export PKG_CONFIG_PATH="$HOME/ffmpeg-windows/lib/pkgconfig:$PKG_CONFIG_PATH"
 
-          # --extra-cflags/--extra-ldflags eksplisit di sini KHUSUS buat
-          # libmp3lame: beda dengan dav1d (Meson otomatis generate
-          # dav1d.pc yang ke-pickup lewat PKG_CONFIG_PATH di atas), LAME
-          # (autotools polos) TIDAK generate file .pc sama sekali -- tanpa
-          # baris ini, configure gak bakal nemu lame/lame.h & libmp3lame.a
-          # yang di-install ke prefix custom ($HOME/ffmpeg-windows) di step
-          # "Kompilasi libmp3lame statis" di atas, dan --enable-libmp3lame
-          # bakal gagal diam-diam (fallback ke encoder gak ke-enable, bukan
-          # error keras) sehingga error yang sama tetap muncul di runtime.
-          #
-          # [UPDATE FFmpeg 9.0] `libpostproc` sudah DIHAPUS TOTAL dari FFmpeg
-          # (patch upstream Mei 2025, jadi udah gak ada lagi mulai rilis 9.0).
-          # Opsi `--disable-postproc` yang dulu ada di sini sekarang gak
-          # dikenali sama sekali sama configure ("Unknown option") dan bikin
-          # configure langsung exit 1 sebelum sempet ngecek opsi lain -- baris
-          # itu DIHAPUS di sini, bukan cuma di-skip, karena keberadaannya aja
-          # (mau enable atau disable) udah bikin error. Gak ada dampak fungsional
-          # ke media_engine karena postproc emang gak pernah dipakai (cuma
-          # filter `pp` di libavfilter yang sekarang udah hilang bareng lib-nya).
-          #
-          # [UPDATE FFmpeg 9.0] `d3d12va` adalah hwaccel BARU (Direct3D 12
-          # video acceleration) yang baru ditambahin di FFmpeg 9.0, gak ada
-          # di 7.1. Meskipun ini autodetect (gak dulu eksplisit di-enable),
-          # header publik `libavutil/hwcontext_d3d12va.h` tetep ke-install
-          # dan ke-parse sama bindgen-nya ffmpeg-sys-next -- header itu
-          # nge-include `d3d12video.h` (bagian dari DirectX 12 Video API)
-          # yang gak ada di paket mingw-w64 Ubuntu yang kepasang di step
-          # "Pasang toolchain cross mingw-w64" (headernya kekinian banget),
-          # jadi bindgen gagal dengan "fatal error: 'd3d12video.h' file not
-          # found". Sama kayak d3d11va/dxva2/mediafoundation, kita gak butuh
-          # hardware decode di target build ini, jadi paling simpel
-          # ditambahin `--disable-d3d12va` (lihat di bawah) biar headernya
-          # gak ke-install sama sekali.
           ./configure \
             --prefix="$HOME/ffmpeg-windows" \
             --enable-cross-compile \
@@ -261,20 +163,17 @@ jobs:
             --enable-libdav1d \
             --enable-libmp3lame \
             --enable-libvorbis \
-            --extra-cflags="-I$HOME/ffmpeg-windows/include" \
+            --enable-asm \
+            --enable-x86asm \
+            --extra-cflags="-O3 -I$HOME/ffmpeg-windows/include" \
             --extra-ldflags="-L$HOME/ffmpeg-windows/lib" \
             --pkg-config="pkg-config --static" 
             
           make -j"$(nproc)"
           make install
           
-          # Remove problematic hardware context headers to prevent bindgen errors
           rm -f "$HOME/ffmpeg-windows/include/libavutil/hwcontext_d3d12va.h"
 
-      # [BARU] Selalu set FFMPEG_DIR di sini (bukan di dalam step compile),
-      # supaya tetap ke-set dengan benar walau step compile di atas di-skip
-      # karena cache-hit -- sebelumnya env ini cuma di-export kalau step
-      # compile benar-benar jalan.
       - name: Set FFMPEG_DIR
         run: echo "FFMPEG_DIR=$HOME/ffmpeg-windows" >> "$GITHUB_ENV"
 
@@ -289,7 +188,6 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install maturin
 
-      # 🔧 Cargo perlu tau linker mana yang dipakai buat target windows-gnu.
       - name: Setup linker cargo buat target windows-gnu
         run: |
           mkdir -p .cargo
@@ -304,32 +202,7 @@ jobs:
               "-C", "link-arg=-lsecur32",
               "-C", "link-arg=-lole32",
               "-C", "link-arg=-lcrypt32",
-              # [UPDATE FFmpeg 9.0] `libavformat/tls_schannel.c` -- backend TLS
-              # native Windows (SChannel + CNG) yang BARU di FFmpeg 9.0, auto-
-              # kompilasi begitu target-os=mingw32 (gak butuh --enable flag
-              # apapun, beda dari openssl/gnutls yang opt-in). Dia manggil
-              # fungsi CNG (NCryptOpenStorageProvider, NCryptCreatePersistedKey,
-              # dst) yang tinggal di ncrypt.dll -- import lib-nya (`libncrypt.a`)
-              # udah ada bawaan mingw-w64, tapi gak otomatis ke-link, jadi
-              # ditambahin manual di sini. Ini juga artinya https:// di
-              # PlayerEngine kemungkinan udah/bakal jalan lewat SChannel
-              # bawaan Windows begitu ini kelar, bukan lewat openssl/gnutls
-              # (jadi catatan soal "belum ada backend TLS" di komentar
-              # Cargo.toml sebelumnya perlu direvisi -- akan dicek ulang).
               "-C", "link-arg=-lncrypt",
-              # [FIX] Bungkus lib statis kita + runtime mingw pakai
-              # --start-group/--end-group. `ld` itu single-pass (scan kiri
-              # ke kanan sekali doang) -- tanpa group ini, `-lmp3lame` di
-              # ujung command butuh simbol libc/libm (powf, sqrt, strcat,
-              # fflush, ftell, __mingw_vsprintf, __imp_toupper dst) yang
-              # ada di `-lmsvcrt`/`-lmingwex`, TAPI kedua lib itu sudah
-              # "kelewat" diproses duluan (posisinya di depan command,
-              # sebelum -l custom kita) -> ld gak balik nyari lagi ->
-              # "undefined reference" walau fungsinya sebenarnya ada.
-              # Dengan --start-group/--end-group, ld looping ulang di
-              # dalam grup ini sampai semua simbol ke-resolve -- jadi juga
-              # future-proof kalau nanti nambah lib statis lain lagi
-              # (mis. libopus), gak perlu mikirin urutan manual per lib.
               "-C", "link-arg=-Wl,--start-group",
               "-C", "link-arg=-ldav1d",
               "-C", "link-arg=-lmp3lame",
@@ -343,36 +216,18 @@ jobs:
           ]
           EOF
 
-      # 🩹 [FIX] bindgen (ffmpeg-sys-next 9.0.1) ikut nge-parse <immintrin.h>
-      # bawaan clang 18, yang nge-include SEMUA header AMX (amxintrin.h,
-      # amxcomplexintrin.h, dst). Di target x86_64-pc-windows-gnu (layout
-      # ms_struct), struct `__tile1024i_str` di amxintrin.h dihasilkan bindgen
-      # dengan #[repr(packed)] + align(64) sekaligus -> rustc E0587/E0080.
-      # FFmpeg gak pakai AMX sama sekali, jadi semua header AMX di-skip
-      # lewat include guard-nya. Nama guard di-grep langsung dari header clang
-      # di runner (bukan ditulis manual) dan harus SEMUA header, karena
-      # men-skip amxintrin.h doang bikin amxcomplexintrin.h gagal dengan
-      # "unknown type name '_tile1024i'". Dikirim ke step berikutnya lewat
-      # GITHUB_ENV -- jadi JANGAN set BINDGEN_EXTRA_CLANG_ARGS_* lagi di
-      # `env:` step maturin (bakal menimpa hasil ini).
-      - name: 🩹 Skip header AMX buat bindgen (E0587 di target mingw)
+      - name: 🩹 Skip header AMX & SIMD intrinsics buat bindgen (Clang 21 mingw)
         run: |
-          inc=/usr/lib/llvm-18/lib/clang/18/include
+          inc=/usr/lib/llvm-21/lib/clang/21/include
           if [ ! -d "$inc" ]; then
             inc="$(dirname "$(find /usr/lib -path '*/clang/*/include/immintrin.h' | head -n1)")"
           fi
           defs="$(grep -h -m1 '^#ifndef __AMX' "$inc"/amx*.h | awk '{print "-D"$2}' | sort -u | tr '\n' ' ')"
-          if [ -z "$defs" ]; then
-            echo "::error::Guard AMX tidak ketemu di $inc"
-            exit 1
-          fi
-          echo "Header dir : $inc"
-          echo "Guard AMX  : $defs"
-          echo "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu=$defs" >> "$GITHUB_ENV"
-
-      # ⚙️ FFmpeg udah dikompilasi manual di step sebelumnya dan diarahkan
-      # lewat FFMPEG_DIR (env, sudah di-export ke $GITHUB_ENV). ffmpeg-sys-next
-      # tinggal linking ke situ, gak nyoba compile ulang dari source lagi.
+          simd_guards="-D_MM_MALLOC_H_INCLUDED -D__MM_MALLOC_H -D__X86INTRIN_H -D__IMMINTRIN_H -D__MMINTRIN_H -D__XMMINTRIN_H -D__EMMINTRIN_H -D__PMMINTRIN_H -D__TMMINTRIN_H -D__SMMINTRIN_H -D__NMMINTRIN_H -D__WMMINTRIN_H -D__AVXINTRIN_H -D__AVX2INTRIN_H -D__F16CINTRIN_H -D__FMAINTRIN_H"          
+          echo "Header dir  : $inc"
+          echo "Guard flags : $simd_guards $defs"
+          echo "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu=$simd_guards $defs" >> "$GITHUB_ENV"
+          
       - name: ⚙️ Kompilasi Modul Rust (link ke FFmpeg hasil cross-compile)
         timeout-minutes: 30
         env:
@@ -380,11 +235,6 @@ jobs:
           FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"
         run: maturin build --release --target x86_64-pc-windows-gnu --out dist -vv
 
-      # 🩺 Kalau step kompilasi FFmpeg manual di atas gagal, config.log-nya
-      # ada di ffmpeg-src/ffbuild/config.log. Kalau justru step linking modul
-      # Rust yang gagal, cek dulu bagian "--- stderr"/"--- stdout" dari error
-      # cargo/maturin di step sebelumnya (biasanya sudah cukup jelas untuk
-      # kasus linker, bukan lagi soal configure FFmpeg).
       - name: 🩺 Dump config.log FFmpeg kalau gagal
         if: failure()
         run: |
