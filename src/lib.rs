@@ -611,6 +611,11 @@ struct Shared {
     // karena sedang menunggu decode thread video & audio menyiapkan frame di titik
     // seek (non-blocking seek agar UI tidak freeze saat scrubbing VP9 GOP panjang).
     seek_resuming: AtomicBool,
+    // [BARU] True kalau setelah seek (baik saat playing maupun paused), frame video
+    // pertama hasil seek belum diambil oleh get_frame(). Dipakai agar hanya 1 frame
+    // pertama hasil seek yang langsung ditampilkan, dan TIDAK menguras antrian
+    // readahead video_q saat playback berada dalam kondisi paused biasa!
+    force_first_frame: AtomicBool,
 }
 
 impl Shared {
@@ -1020,6 +1025,7 @@ impl PlayerEngine {
             clock_base_pts: Mutex::new(0.0),
             clock_base_wall: Mutex::new(None),
             seek_resuming: AtomicBool::new(false),
+            force_first_frame: AtomicBool::new(false),
         });
 
         // ── Setup cpal output stream (kalau ada audio) ──
@@ -1303,14 +1309,29 @@ impl PlayerEngine {
     /// Mulai/lanjutkan playback.
     fn play(&mut self) {
         if !self.shared.playing.swap(true, Ordering::SeqCst) {
-            // Non-blocking: biarkan get_frame() atau position() menyalakan
-            // stream cpal begitu audio & video siap di posisi target, atau
-            // tunggu singkat (~15ms) kalau sudah hampir siap.
-            let target = self.shared.position();
-            let seq = self.shared.seek_seq.load(Ordering::SeqCst);
-            self.shared.seek_resuming.store(true, Ordering::SeqCst);
-            if self.wait_for_seek_ready_brief(target, seq, Duration::from_millis(16)) {
-                self.finish_seek_resume();
+            // Cek apakah ini resume dari pause biasa (sudah ada frame readahead di
+            // video_q / buffer audio) atau play awal / setelah seek yang antriannya
+            // masih kosong. Jika antrian sudah terisi (resume dari pause), langsung
+            // nyalakan stream audio cpal tanpa masuk ke mode seek_resuming!
+            let v_ready = !self.has_video
+                || self.shared.eof.load(Ordering::Relaxed)
+                || !self.shared.video_q.lock().unwrap().is_empty();
+            let a_ready = !self.has_audio
+                || self.shared.audio_eof.load(Ordering::Relaxed)
+                || self.shared.audio_buffered_hint.load(Ordering::Relaxed) > 0;
+
+            if v_ready && a_ready && !self.shared.seek_resuming.load(Ordering::SeqCst) {
+                if let Some(stream) = self._audio_stream.as_ref() {
+                    let _ = stream.play();
+                }
+                *self.shared.clock_base_wall.lock().unwrap() = Some(Instant::now());
+            } else {
+                let target = self.shared.position();
+                let seq = self.shared.seek_seq.load(Ordering::SeqCst);
+                self.shared.seek_resuming.store(true, Ordering::SeqCst);
+                if self.wait_for_seek_ready_brief(target, seq, Duration::from_millis(16)) {
+                    self.finish_seek_resume();
+                }
             }
         }
     }
@@ -1398,6 +1419,7 @@ impl PlayerEngine {
         // agar thread video & audio tidak saling menimpa clock/flush satu sama lain!
         self.shared.video_q.lock().unwrap().clear();
         self.shared.reset_clock(target);
+        self.shared.force_first_frame.store(true, Ordering::SeqCst);
 
         let new_seq = self.shared.seek_seq.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -1519,10 +1541,6 @@ impl PlayerEngine {
         let now = self.shared.position();
         let mut q = self.shared.video_q.lock().unwrap();
 
-        // Saat baru selesai seek atau sedang paused, tampilkan frame pertama yang
-        // sudah tiba di titik seek meskipun PTS-nya sedikit di depan `now` (mis.
-        // karena pembulatan timestamp paket VP9/WebM atau audio frame pertama sedikit
-        // lebih awal dari frame video pertama setelah titik seek).
         let is_paused = !self.shared.playing.load(Ordering::Relaxed);
         let is_resuming = self.shared.seek_resuming.load(Ordering::Relaxed);
 
@@ -1543,8 +1561,24 @@ impl PlayerEngine {
             }
         }
 
+        // PENTING: JANGAN menguras `video_q` saat kondisi `is_paused` biasa!
+        // Saat paused, `video_q` menyimpan hingga 90 frame readahead (~3 detik)
+        // yang sudah di-decode sebelum pause. Kalau `is_paused` selalu dianggap
+        // `ready`, timer UI (_on_tick tiap 10ms) akan mem-pop seluruh 90 frame
+        // readahead dalam <1 detik selama video di-pause (terlihat fast-forward
+        // lalu habis), dan saat di-resume (terutama H.264 dengan B-frame reorder)
+        // PTS video sudah terlanjur loncat 3 detik di depan audio sehingga video
+        // freeze menunggu audio selama 3 detik!
+        // Sebagai gantinya, gunakan one-shot flag `force_first_frame` yang hanya
+        // di-set `true` tepat 1x saat `seek()` dipanggil.
+        let force_show = if q.front().is_some() {
+            self.shared.force_first_frame.swap(false, Ordering::SeqCst)
+        } else {
+            false
+        };
+
         let ready = match q.front() {
-            Some(f) => f.pts <= now || is_paused || is_resuming,
+            Some(f) => f.pts <= now || force_show,
             None => false,
         };
         if !ready {
@@ -1820,34 +1854,47 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
 
         if !is_playing && !need_paused_seek_frame {
             if shared.step_request.swap(false, Ordering::SeqCst) {
-                // Frame-step: paksa decode satu frame video ke depan meski
-                // lagi paused, lalu geser clock persis ke pts frame itu --
-                // jadi get_frame() normal di sisi Python otomatis nemu &
-                // nampilin frame ini di tick berikutnya, gak perlu jalur
-                // spesial di get_frame(). Blok ini bounded (maks 500x) dan
-                // jarang dipanggil, jadi tetep pakai iterator yang sama.
-                let mut produced = false;
-                for _ in 0..500 {
-                    let next_packet = packet_iter.as_mut().and_then(|it| it.next());
-                    let (stream, packet) = match next_packet {
-                        Some(p) => p,
-                        None => {
-                            shared.eof.store(true, Ordering::Relaxed);
-                            break;
+                // Frame-step: ambil 1 frame berikutnya dari video_q kalau masih ada
+                // readahead, atau paksa decode satu frame video ke depan kalau video_q
+                // kosong, lalu geser clock persis ke pts frame itu.
+                if let Some(front_pts) = shared.video_q.lock().unwrap().front().map(|f| f.pts) {
+                    shared.reset_clock(front_pts);
+                    shared.force_first_frame.store(true, Ordering::SeqCst);
+                } else {
+                    let mut produced = false;
+                    for _ in 0..500 {
+                        if vdecoder.receive_frame(&mut vframe).is_ok() {
+                            let pts = vframe.pts().or_else(|| vframe.timestamp()).unwrap_or(0) as f64 * vtb;
+                            if let Ok(rgb) = scale_to_rgb(&vframe, &mut scaler, vdecoder.format(), vwidth, vheight) {
+                                shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
+                                shared.reset_clock(pts);
+                                shared.force_first_frame.store(true, Ordering::SeqCst);
+                                produced = true;
+                                break;
+                            }
                         }
-                    };
-                    if stream.index() != video_idx {
-                        continue;
-                    }
-                    if vdecoder.send_packet(&packet).is_ok() && vdecoder.receive_frame(&mut vframe).is_ok() {
-                        let pts = vframe.pts().or_else(|| vframe.timestamp()).unwrap_or(0) as f64 * vtb;
-                        if let Ok(rgb) = scale_to_rgb(&vframe, &mut scaler, vdecoder.format(), vwidth, vheight) {
-                            shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
-                            shared.reset_clock(pts);
-                            produced = true;
+                        let next_packet = packet_iter.as_mut().and_then(|it| it.next());
+                        let (stream, packet) = match next_packet {
+                            Some(p) => p,
+                            None => {
+                                shared.eof.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        };
+                        if stream.index() != video_idx {
+                            continue;
                         }
+                        if vdecoder.send_packet(&packet).is_ok() && vdecoder.receive_frame(&mut vframe).is_ok() {
+                            let pts = vframe.pts().or_else(|| vframe.timestamp()).unwrap_or(0) as f64 * vtb;
+                            if let Ok(rgb) = scale_to_rgb(&vframe, &mut scaler, vdecoder.format(), vwidth, vheight) {
+                                shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
+                                shared.reset_clock(pts);
+                                shared.force_first_frame.store(true, Ordering::SeqCst);
+                                produced = true;
+                            }
+                        }
+                        if produced { break; }
                     }
-                    if produced { break; }
                 }
             } else {
                 thread::sleep(Duration::from_millis(10));
